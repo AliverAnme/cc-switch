@@ -60,9 +60,11 @@ pub fn is_openai_o_series(model: &str) -> bool {
 /// - o-series: o1, o3, o4-mini, etc.
 /// - GPT-5+: gpt-5, gpt-5.1, gpt-5.4, gpt-5-codex, etc.
 /// - GLM: glm-5+, glm-4.6+ (via CF Workers AI, Z.AI, etc.)
+/// - Kimi/Moonshot: kimi-k2+, moonshot models (via CF Workers AI, etc.)
 ///   CF Workers AI exposes `reasoning_effort` as a supported parameter
-///   for GLM-5.2; Z.AI official API may use `thinking` instead, but the
-///   extra field is harmless (CF accepts `string | null`).
+///   for these reasoning models. Official APIs may use `thinking` instead,
+///   but the extra field is harmless (OpenAI-compatible APIs ignore unknown
+///   parameters).
 pub fn supports_reasoning_effort(model: &str) -> bool {
     let lower = model.to_lowercase();
     is_openai_o_series(model)
@@ -71,6 +73,8 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
             .and_then(|rest| rest.chars().next())
             .is_some_and(|c| c.is_ascii_digit() && c >= '5')
         || lower.contains("glm")
+        || lower.contains("kimi")
+        || lower.contains("moonshot")
 }
 
 /// Detect DeepSeek reasoning models (deepseek-chat, deepseek-reasoner,
@@ -1515,6 +1519,11 @@ mod tests {
         assert!(supports_reasoning_effort("glm-5"));
         assert!(supports_reasoning_effort("glm-4.7"));
         assert!(supports_reasoning_effort("@cf/zai-org/glm-5.2"));
+        // Kimi/Moonshot models (CF Workers AI, Moonshot API)
+        assert!(supports_reasoning_effort("kimi-k2.7-code"));
+        assert!(supports_reasoning_effort("kimi-k2.6"));
+        assert!(supports_reasoning_effort("@cf/moonshotai/kimi-k2.7-code"));
+        assert!(supports_reasoning_effort("moonshot/kimi-k2"));
     }
 
     // ── is_deepseek_reasoning_model unit tests ──
@@ -1609,6 +1618,42 @@ mod tests {
     fn test_glm_no_thinking_no_effort() {
         let input = json!({
             "model": "glm-5.2",
+            "max_tokens": 1024
+        });
+        let result = anthropic_to_openai(input).unwrap();
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    // ── Kimi/Moonshot reasoning_effort injection tests (Claude Code → OpenAI Chat path) ──
+
+    #[test]
+    fn test_kimi_thinking_enabled_injects_reasoning_effort() {
+        // Claude Code sends thinking.enabled with budget_tokens.
+        // Kimi K2.7 Code on CF Workers AI accepts standard OpenAI reasoning_effort.
+        let input = json!({
+            "model": "@cf/moonshotai/kimi-k2.7-code",
+            "max_tokens": 1024,
+            "thinking": {"type": "enabled", "budget_tokens": 8000}
+        });
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn test_kimi_thinking_adaptive_injects_xhigh() {
+        let input = json!({
+            "model": "kimi-k2.7-code",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive"}
+        });
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_kimi_no_thinking_no_effort() {
+        let input = json!({
+            "model": "kimi-k2.6",
             "max_tokens": 1024
         });
         let result = anthropic_to_openai(input).unwrap();
