@@ -1026,6 +1026,13 @@ fn build_gateway_profile(
     let mut profile = json!({
         "coworkEgressAllowedHosts": ["*"],
         "disableDeploymentModeChooser": true,
+        // 功能开关：开启 Claude Desktop 的代码执行、自动模式，并关闭遥测与非必要服务，
+        // 与本地 reasoning_effort 注入等增强配合，最大化第三方网关下的可用性。
+        "chatCodeExecutionEnabled": true,
+        "autoModeEnabled": true,
+        "disableEssentialTelemetry": true,
+        "disableNonessentialTelemetry": true,
+        "disableNonessentialServices": true,
         "inferenceGatewayApiKey": api_key,
         "inferenceGatewayAuthScheme": "bearer",
         "inferenceGatewayBaseUrl": base_url,
@@ -1505,6 +1512,11 @@ mod tests {
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
         assert_eq!(profile["disableDeploymentModeChooser"], json!(true));
         assert_eq!(profile["coworkEgressAllowedHosts"], json!(["*"]));
+        assert_eq!(profile["chatCodeExecutionEnabled"], json!(true));
+        assert_eq!(profile["autoModeEnabled"], json!(true));
+        assert_eq!(profile["disableEssentialTelemetry"], json!(true));
+        assert_eq!(profile["disableNonessentialTelemetry"], json!(true));
+        assert_eq!(profile["disableNonessentialServices"], json!(true));
         assert!(profile.get("inferenceModels").is_none());
         assert_eq!(meta["appliedId"], json!(PROFILE_ID));
         assert!(meta["entries"]
@@ -1566,6 +1578,11 @@ mod tests {
         );
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
         assert_eq!(profile["coworkEgressAllowedHosts"], json!(["*"]));
+        assert_eq!(profile["chatCodeExecutionEnabled"], json!(true));
+        assert_eq!(profile["autoModeEnabled"], json!(true));
+        assert_eq!(profile["disableEssentialTelemetry"], json!(true));
+        assert_eq!(profile["disableNonessentialTelemetry"], json!(true));
+        assert_eq!(profile["disableNonessentialServices"], json!(true));
         assert_ne!(profile["inferenceGatewayApiKey"], json!("test-token"));
         assert!(profile["inferenceGatewayApiKey"]
             .as_str()
