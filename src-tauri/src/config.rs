@@ -324,6 +324,49 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
     atomic_write(path, data.as_bytes())
 }
 
+/// 判断 IO 错误是否为穿过符号链接/重解析点时的瞬时错误，值得短暂重试。
+///
+/// Windows 上当目标路径穿过跨卷符号链接（如 `Claude-3p` -> `D:\Exchange\...`）时，
+/// `CreateFileW` 偶发返回 `ERROR_UNTRUSTED_MOUNT_POINT (448)` 或 `ERROR_ALREADY_EXISTS (183)`，
+/// 这类错误与系统对该挂载点那一刻的信任判定、Defender 实时扫描、并发句柄竞争相关，
+/// 具有瞬时性——退避几毫秒后重试通常即可成功。共享冲突 `ERROR_SHARING_VIOLATION (32)`
+/// 同理（Claude Desktop 运行时持有配置文件句柄）。
+#[cfg(windows)]
+fn is_transient_reparse_error(err: &std::io::Error) -> bool {
+    // raw_os_error 覆盖 CreateFileW / CreateDirectoryW 返回的 Win32 错误码。
+    matches!(
+        err.raw_os_error(),
+        Some(448)  // ERROR_UNTRUSTED_MOUNT_POINT
+            | Some(183) // ERROR_ALREADY_EXISTS
+            | Some(32)  // ERROR_SHARING_VIOLATION
+    )
+}
+
+#[cfg(not(windows))]
+fn is_transient_reparse_error(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// 对穿过符号链接的瞬时 IO 错误做有限次退避重试。
+fn retry_transient_io<F>(mut op: F) -> Result<(), std::io::Error>
+where
+    F: FnMut() -> Result<(), std::io::Error>,
+{
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut delay_ms = 10u64;
+    for attempt in 0..MAX_ATTEMPTS {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_reparse_error(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = delay_ms.saturating_mul(2);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    op()
+}
+
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     ensure_parent_dir(path)?;
@@ -343,11 +386,15 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
         .as_nanos();
     tmp.push(format!("{file_name}.tmp.{ts}"));
 
-    {
-        let mut f = fs::File::create(&tmp).map_err(|e| AppError::io(&tmp, e))?;
-        f.write_all(data).map_err(|e| AppError::io(&tmp, e))?;
-        f.flush().map_err(|e| AppError::io(&tmp, e))?;
-    }
+    // 创建临时文件 + 写入。穿过跨卷符号链接时偶发 448/183/32，退避重试。
+    let tmp_for_write = tmp.clone();
+    retry_transient_io(|| {
+        let mut f = fs::File::create(&tmp_for_write)?;
+        f.write_all(data)?;
+        f.flush()?;
+        Ok(())
+    })
+    .map_err(|e| AppError::io(&tmp, e))?;
 
     #[cfg(unix)]
     {
@@ -358,25 +405,22 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
         }
     }
 
-    #[cfg(windows)]
-    {
-        // Windows 上 rename 目标存在会失败，先移除再重命名（尽量接近原子性）
-        if path.exists() {
-            let _ = fs::remove_file(path);
+    // Windows 上 rename 目标存在会失败，先移除再重命名。rename 同样可能因穿过
+    // 符号链接瞬时失败（448/183/32），一并重试。
+    let rename_op = || -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
         }
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
-    }
-
-    #[cfg(not(windows))]
-    {
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
-            context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
-            source: e,
-        })?;
-    }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    retry_transient_io(rename_op).map_err(|e| AppError::IoContext {
+        context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -614,6 +658,45 @@ mod tests {
                 .expect("symlink_metadata")
                 .is_symlink(),
             "symlink must be preserved, not replaced"
+        );
+    }
+
+    #[test]
+    fn retry_transient_io_recovers_after_transient_errors() {
+        // 模拟穿过符号链接时前两次返回 448/183（瞬时），第三次成功。
+        // 验证重试机制能把瞬时错误吞掉并最终成功。
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let result: Result<(), std::io::Error> = retry_transient_io(|| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 {
+                // 用 raw_os_error 构造 Windows 瞬时错误（448/183），跨平台测试中
+                // is_transient_reparse_error 在 Windows 上识别，非 Windows 返回 false。
+                Err(std::io::Error::from_raw_os_error(448))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_ok(), "should recover after transient errors");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "should have attempted 3 times"
+        );
+    }
+
+    #[test]
+    fn retry_transient_io_returns_non_transient_error_immediately() {
+        // 非瞬时错误（如 NotFound = 2）不应触发重试，立即返回。
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let result: Result<(), std::io::Error> = retry_transient_io(|| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(std::io::Error::from_raw_os_error(2)) // ERROR_FILE_NOT_FOUND
+        });
+        assert!(result.is_err(), "non-transient error should be returned");
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-transient error should not retry"
         );
     }
 }
