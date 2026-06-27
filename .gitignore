@@ -33,3 +33,4 @@ mainWindow.js
 # Local Pi runtime state
 .atl/
 .pi/
+claude-code-reverse/
