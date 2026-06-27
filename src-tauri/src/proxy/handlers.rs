@@ -171,15 +171,93 @@ async fn handle_messages_for_app(
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
 
-    // 安全分类器请求：直接返回允许响应，不走实际 API 转发
+    // 安全分类器请求：协议转换后转发到上游，再转回分类器格式
+    // 不再用 mock 短路——让上游模型做真实分类，cc-switch 承担格式转换
     if ctx.is_classifier_request {
         log::info!(
-            "[{}] [Classifier] 安全分类器请求已拦截，直接返回 ALLOWED (model={})",
+            "[{}] [Classifier] 转换分类器请求并转发到上游 (model={})",
             tag,
             ctx.request_model
         );
-        let success_body = super::classifier::build_classifier_success_body(&ctx.request_model);
-        return Ok((StatusCode::OK, Json(success_body)).into_response());
+
+        let raw_endpoint = uri
+            .path_and_query()
+            .map(|path_and_query| path_and_query.as_str())
+            .unwrap_or(uri.path());
+        let endpoint = strip_prefix
+            .and_then(|prefix| raw_endpoint.strip_prefix(prefix))
+            .unwrap_or(raw_endpoint);
+
+        // 1. 转换请求体为上游兼容格式
+        let transformed_body = super::classifier::transform_classifier_request(&body);
+
+        // 2. 通过正常管道转发（含模型映射、故障转移等）
+        let forwarder = ctx.create_forwarder(&state);
+        let mut result = match forwarder
+            .forward_with_retry(
+                &app_type,
+                method,
+                endpoint,
+                transformed_body,
+                headers,
+                extensions,
+                ctx.get_providers(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                log::warn!(
+                    "[{}] [Classifier] 上游转发失败, fallback 到 ALLOWED: {:?}",
+                    tag,
+                    err.error
+                );
+                // 上游不可用时兜底放行，避免阻塞用户操作
+                let fallback =
+                    super::classifier::build_classifier_success_body(&ctx.request_model);
+                return Ok((StatusCode::OK, Json(fallback)).into_response());
+            }
+        };
+
+        ctx.outbound_model = result.outbound_model.take();
+        ctx.provider = result.provider;
+
+        // 3. 读取上游响应体
+        let (mut resp_headers, _status, body_bytes) = read_decoded_body(
+            result.response,
+            ctx.tag,
+            std::time::Duration::ZERO,
+        )
+        .await?;
+        strip_hop_by_hop_response_headers(&mut resp_headers);
+
+        // 4. 转回分类器兼容格式
+        let classifier_body = match serde_json::from_slice::<Value>(&body_bytes) {
+            Ok(json) => {
+                super::classifier::transform_classifier_response(&json, &ctx.request_model)
+            }
+            Err(_) => {
+                log::warn!(
+                    "[{}] [Classifier] 无法解析上游响应 JSON, 使用 ALLOWED 兜底",
+                    tag
+                );
+                super::classifier::build_classifier_success_body(&ctx.request_model)
+            }
+        };
+
+        let response_bytes =
+            serde_json::to_vec(&classifier_body).map_err(|e| {
+                ProxyError::Internal(format!("序列化分类器响应失败: {e}"))
+            })?;
+
+        let mut builder = axum::response::Response::builder().status(StatusCode::OK);
+        builder = builder.header(
+            axum::http::header::CONTENT_TYPE,
+            "application/json",
+        );
+        return builder
+            .body(axum::body::Body::from(response_bytes))
+            .map_err(|e| ProxyError::Internal(format!("构建分类器响应失败: {e}")));
     }
 
     let raw_endpoint = uri

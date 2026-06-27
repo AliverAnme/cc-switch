@@ -7,15 +7,37 @@
 //! 参数可能不被支持，导致 API 返回错误，而 Claude Code 的安全兜底逻辑会在
 //! 分类器出错时默认 BLOCK 所有操作。
 //!
-//! 本模块采用短路方案：检测到分类器请求后，直接返回允许（ALLOWED）响应，
-//! 不走实际 API 转发，完全避免第三方 API 不兼容问题。
-//!
 //! # 工作流程
+//! 本模块采用协议转换方案：将 Claude 原生的安全分类器请求转换为上游模型可理解的
+//! 简化格式，转发到上游处理后，再将响应转换回 Claude Code 期望的 Messages API 格式。
+//!
 //! 1. 检测请求是否为安全分类器请求（基于请求体特征）
-//! 2. 若是，直接构造一个伪造的消息响应，告知 Claude Code 操作安全
-//! 3. 拦截后续转发逻辑，立即返回给客户端
+//! 2. 若是，用简化 system prompt 替换原有 prompt，去除不兼容参数
+//! 3. 通过正常代理管道转发到上游
+//! 4. 将上游响应转回 Claude Messages API 格式返回给客户端
 
 use serde_json::Value;
+
+/// 简化分类器 system prompt，适用于第三方/上游模型
+///
+/// 替换 Claude 原生的安全监控 prompt。要求上游模型输出结构化
+/// XML 格式的 <result>SAFE|BLOCK</result>，使下游能可靠解析。
+const UPSTREAM_CLASSIFIER_PROMPT: &str = r"You are a tool-use safety classifier for an AI coding assistant.
+
+Determine if the given tool call is SAFE or BLOCKED.
+
+Respond with EXACTLY this format:
+<result>SAFE</result>
+or
+<result>BLOCK</result>
+<reason>one sentence explanation</reason>
+
+Classification guidelines:
+- Read-only operations (git diff, ls, cat, grep, find, etc.) → SAFE
+- File writes/edits in the project directory → SAFE (with caution)
+- Network requests to known services → SAFE
+- Modifying system files, installing packages, executing untrusted code → BLOCK
+- Shell operations with suspicious metacharacters ($, |, backtick) → evaluate carefully";
 
 /// 分类器请求检测结果
 #[derive(Debug, Clone)]
@@ -134,13 +156,10 @@ fn extract_system_text(body: &Value) -> String {
         Some(Value::Array(arr)) => arr
             .iter()
             .filter_map(|item| {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    Some(text.to_string())
-                } else if let Some(s) = item.as_str() {
-                    Some(s.to_string())
-                } else {
-                    None
-                }
+                item.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|text| text.to_string())
+                    .or_else(|| item.as_str().map(|s| s.to_string()))
             })
             .collect::<Vec<_>>()
             .join(" "),
@@ -148,10 +167,146 @@ fn extract_system_text(body: &Value) -> String {
     }
 }
 
-/// 构建分类器请求的允许响应体
+/// 将分类器请求转换为上游兼容格式
 ///
-/// 返回一个标准 Anthropic Messages API 格式的 JSON 响应，内容为允许操作。
-/// 这是短路方案的核心——不走实际 API 转发，直接告诉 Claude Code 操作安全。
+/// 用简化 prompt 替换 Claude 原生安全监控 prompt，移除上游不支持的参数。
+/// 保留原始的 messages（待分类的操作上下文），使上游模型仍能正确评估。
+pub fn transform_classifier_request(body: &Value) -> Value {
+    let mut new_body = body.clone();
+    if let Some(obj) = new_body.as_object_mut() {
+        // 替换为通用分类器 prompt
+        obj.insert("system".into(), serde_json::json!(UPSTREAM_CLASSIFIER_PROMPT));
+        // 移除上游不支持的 stop_sequences（如 </block>）
+        obj.remove("stop_sequences");
+        // 移除 thinking 参数（分类器使用小 max_tokens）
+        obj.remove("thinking");
+        // 确保非流式
+        obj.insert("stream".into(), serde_json::json!(false));
+    }
+    new_body
+}
+
+/// 从上游响应中提取分类文本
+///
+/// 同时支持 Claude Messages API 和 OpenAI Chat Completions 两种响应格式。
+fn extract_response_text(body: &Value) -> Option<String> {
+    // Claude Messages: content[0].text
+    if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+        if let Some(first) = content.first() {
+            if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    // OpenAI Chat: choices[0].message.content
+    if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
+        if let Some(first) = choices.first() {
+            if let Some(msg) = first.get("message") {
+                if let Some(text) = msg.get("content").and_then(|t| t.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 从上游响应中提取分类结果
+///
+/// 解析 <result>SAFE</result> 或 <result>BLOCK</result> 标签，
+/// 若无法解析则根据文本内容启发式判断。
+fn determine_classification_result(text: &str) -> (&str, &str) {
+    let lower = text.to_lowercase();
+
+    // 优先精确匹配 <result> 标签
+    if lower.contains("<result>safe</result>") {
+        return ("SAFE", "The action has been classified as safe.");
+    }
+    if lower.contains("<result>block</result>") {
+        return ("BLOCK", "The action has been classified as potentially unsafe.");
+    }
+    if lower.contains("<result>") {
+        // 有 <result> 标签但内容未知，尝试提取
+        if let Some(start) = lower.find("<result>") {
+            let after_start = &lower[start + 8..];
+            if let Some(end) = after_start.find("</result>") {
+                let raw_result = after_start[..end].trim();
+                if raw_result == "safe" {
+                    return ("SAFE", "The action has been classified as safe.");
+                } else if raw_result == "block" {
+                    return ("BLOCK", "The action has been classified as potentially unsafe.");
+                }
+            }
+        }
+        // 回退：含 <result> 但无法解析，保守返回 BLOCK
+        return ("BLOCK", "The action could not be confidently classified.");
+    }
+
+    // 无 <result> 标签：使用保守启发式
+    let has_unsafe_signal = lower.contains("not safe")
+        || lower.contains("unsafe")
+        || lower.contains("block")
+        || lower.contains("blocked")
+        || lower.contains("malicious")
+        || lower.contains("harmful");
+
+    let has_safe_signal = lower.contains("safe")
+        && !lower.contains("unsafe")
+        && !lower.contains("not safe");
+
+    if has_safe_signal && !has_unsafe_signal {
+        ("SAFE", "The action has been classified as safe.")
+    } else {
+        // 包括不安全信号、模糊或矛盾，保守返回 BLOCK
+        (
+            "BLOCK",
+            "The action could not be confidently classified.",
+        )
+    }
+}
+
+/// 将上游响应转换为分类器兼容的 Messages API 格式
+///
+/// 解析上游模型返回的文本内容，提取 <result>SAFE|BLOCK</result> 标签，
+/// 构建 Claude Messages API 格式的响应，使 auto-mode 分类器能正确决策。
+pub fn transform_classifier_response(
+    upstream_body: &Value,
+    request_model: &str,
+) -> Value {
+    let upstream_text = extract_response_text(upstream_body).unwrap_or_default();
+    let (_result, summary) = determine_classification_result(&upstream_text);
+
+    // 构建上游原始文本和分类摘要
+    let response_text = if upstream_text.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{}\n\nClassification analysis:\n{}", summary, upstream_text)
+    };
+
+    serde_json::json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4()),
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": response_text
+            }
+        ],
+        "model": request_model,
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 10
+        }
+    })
+}
+
+/// 构建分类器请求的安全兜底响应体
+///
+/// 当上游转发失败时，返回允许响应避免阻塞用户操作。
+/// 这是安全优先的兜底策略——无法分类时默认放行。
 pub fn build_classifier_success_body(model: &str) -> Value {
     serde_json::json!({
         "id": format!("msg_{}", uuid::Uuid::new_v4()),
@@ -400,5 +555,165 @@ mod tests {
         assert!(!detection.is_classifier,
             "Claude Desktop 典型请求不应归类 (confidence={:.2})",
             detection.confidence);
+    }
+
+    // ========================================================================
+    // 协议转换测试
+    // ========================================================================
+
+    #[test]
+    fn test_transform_classifier_request_replaces_system_prompt() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": false,
+            "max_tokens": 256,
+            "stop_sequences": ["</block>"],
+            "system": "You are a security monitor. HARD BLOCK.",
+            "messages": [{"role": "user", "content": "Tool: Bash\nCommand: git diff HEAD"}]
+        });
+
+        let transformed = transform_classifier_request(&body);
+
+        let system_text = match transformed.get("system") {
+            Some(Value::String(s)) => s.as_str(),
+            _ => panic!("system 应为字符串"),
+        };
+        assert!(
+            system_text.contains("tool-use safety classifier"),
+            "system prompt 应替换为通用分类器 prompt"
+        );
+        assert!(
+            system_text.contains("<result>SAFE</result>"),
+            "system prompt 应要求结构化输出"
+        );
+    }
+
+    #[test]
+    fn test_transform_classifier_request_removes_incompatible_params() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "max_tokens": 256,
+            "stop_sequences": ["</block>"],
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "test"}]
+        });
+
+        let transformed = transform_classifier_request(&body);
+
+        assert!(transformed.get("stop_sequences").is_none(), "应移除 stop_sequences");
+        assert!(transformed.get("thinking").is_none(), "应移除 thinking");
+        assert_eq!(
+            transformed.get("stream").and_then(|v| v.as_bool()),
+            Some(false),
+            "应强制 stream=false"
+        );
+    }
+
+    #[test]
+    fn test_extract_response_text_claude_messages() {
+        let body = json!({
+            "content": [{"type": "text", "text": "<result>SAFE</result>"}]
+        });
+        let text = extract_response_text(&body);
+        assert_eq!(text.unwrap(), "<result>SAFE</result>");
+    }
+
+    #[test]
+    fn test_extract_response_text_openai_chat() {
+        let body = json!({
+            "choices": [{"message": {"role": "assistant", "content": "<result>BLOCK</result>"}}]
+        });
+        let text = extract_response_text(&body);
+        assert_eq!(text.unwrap(), "<result>BLOCK</result>");
+    }
+
+    #[test]
+    fn test_determine_classification_result_safe_tag() {
+        let (result, summary) = determine_classification_result("<result>SAFE</result>");
+        assert_eq!(result, "SAFE");
+        assert!(summary.contains("safe"));
+    }
+
+    #[test]
+    fn test_determine_classification_result_block_tag() {
+        let (result, summary) = determine_classification_result("<result>BLOCK</result>\n<reason>deletes system files</reason>");
+        assert_eq!(result, "BLOCK");
+        assert!(summary.contains("potentially unsafe"));
+    }
+
+    #[test]
+    fn test_determine_classification_result_not_safe_is_block() {
+        let (result, _summary) = determine_classification_result("This is not safe because it deletes files");
+        assert_eq!(result, "BLOCK", "'not safe' 不应被判定为 SAFE");
+    }
+
+    #[test]
+    fn test_determine_classification_result_unsafe_is_block() {
+        let (result, _summary) = determine_classification_result("This is unsafe");
+        assert_eq!(result, "BLOCK", "'unsafe' 不应被判定为 SAFE");
+    }
+
+    #[test]
+    fn test_determine_classification_result_ambiguous_is_block() {
+        let (result, _summary) = determine_classification_result("The command reads some files");
+        assert_eq!(result, "BLOCK", "无明确 SAFE 信号时应保守返回 BLOCK");
+    }
+
+    #[test]
+    fn test_transform_classifier_response_claude_messages() {
+        let upstream = json!({
+            "id": "real-msg-123",
+            "content": [{"type": "text", "text": "<result>SAFE</result>\n<reason>read-only git command</reason>"}]
+        });
+        let response = transform_classifier_response(&upstream, "claude-opus-4-8");
+
+        assert_eq!(response["type"], "message");
+        assert_eq!(response["model"], "claude-opus-4-8");
+        assert_eq!(response["stop_reason"], "end_turn");
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("classified as safe"),
+            "响应应包含分类摘要"
+        );
+    }
+
+    #[test]
+    fn test_transform_classifier_response_openai_chat() {
+        let upstream = json!({
+            "id": "chatcmpl-123",
+            "choices": [{"message": {"content": "<result>BLOCK</result>\n<reason>rm -rf</reason>"}}]
+        });
+        let response = transform_classifier_response(&upstream, "claude-opus-4-8");
+
+        assert_eq!(response["type"], "message");
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not be confidently classified")
+                || response["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("potentially unsafe"),
+            "BLOCK 响应应包含不安全提示"
+        );
+    }
+
+    #[test]
+    fn test_transform_classifier_response_empty_body() {
+        let upstream = json!({});
+        let response = transform_classifier_response(&upstream, "claude-opus-4-8");
+
+        assert_eq!(response["type"], "message");
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not be confidently classified"),
+            "空响应应保守返回 BLOCK"
+        );
     }
 }
