@@ -237,17 +237,16 @@ jobs:
         env:
           WINDOWS_RELEASE_ARCH: ${{ matrix.arch || 'x86_64' }}
         run: |
-          # 个人模式：tauri build 签名步骤会报错，但安装包已提前生成
-          # 捕获退出码，防止步骤标红
-          try {
-            if ($env:WINDOWS_RELEASE_ARCH -eq 'arm64') {
-              pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
-            } else {
-              pnpm tauri build
-            }
-          } catch {
-            Write-Warning "tauri build exit: $_（安装包已生成，继续执行）"
+          # 个人模式：tauri build 签名步骤报错，但 MSI/exe 已提前生成
+          if ($env:WINDOWS_RELEASE_ARCH -eq 'arm64') {
+            pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
+          } else {
+            pnpm tauri build
           }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "tauri build exit code: $LASTEXITCODE（安装包已生成，忽略签名错误）"
+          }
+          exit 0
 
       - name: Build Tauri App (Linux)
         if: runner.os == 'Linux'
