@@ -14,9 +14,6 @@
 .rust-env: &rust-env
   docker:
     image: rust:1.85-bookworm
-    volumes:
-      - cargo-cache
-      - node_modules
   env:
     DEBIAN_FRONTEND: noninteractive
     CARGO_HOME: /usr/local/cargo
