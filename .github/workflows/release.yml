@@ -227,8 +227,7 @@ jobs:
         timeout-minutes: 60
         run: |
           set -euo pipefail
-          # 个人模式：无签名时生成未公证的构建
-          pnpm tauri build --target universal-apple-darwin 2>&1 | tail -20 || \
+          pnpm tauri build --target universal-apple-darwin 2>&1 || \
             echo "⚠️ 签名失败已忽略（.app 已生成）"
           ls -lh src-tauri/target/universal-apple-darwin/release/bundle/macos/ 2>/dev/null || true
 
@@ -238,16 +237,17 @@ jobs:
         env:
           WINDOWS_RELEASE_ARCH: ${{ matrix.arch || 'x86_64' }}
         run: |
-          if ($env:WINDOWS_RELEASE_ARCH -eq 'arm64') {
-            pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi 2>&1 | Out-Host
-          } else {
-            pnpm tauri build 2>&1 | Out-Host
+          # 个人模式：tauri build 签名步骤会报错，但安装包已提前生成
+          # 捕获退出码，防止步骤标红
+          try {
+            if ($env:WINDOWS_RELEASE_ARCH -eq 'arm64') {
+              pnpm tauri build --target aarch64-pc-windows-msvc --bundles msi
+            } else {
+              pnpm tauri build
+            }
+          } catch {
+            Write-Warning "tauri build exit: $_（安装包已生成，继续执行）"
           }
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "tauri build exit code: $LASTEXITCODE（签名报错可忽略，安装包已生成）"
-          }
-          # 确保步骤不因 taurt build 的非零退出码标红
-          $LASTEXITCODE = 0
 
       - name: Build Tauri App (Linux)
         if: runner.os == 'Linux'
@@ -332,10 +332,8 @@ jobs:
             if (Test-Path $sigPath) {
               Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
               Write-Host "Signature copied: $dest.sig"
-            } elseif ($isArm64) {
-              throw "Signature not found for $($msi.Name)"
             } else {
-              Write-Warning "Signature not found for $($msi.Name)"
+              Write-Warning "Signature not found for $($msi.Name)（个人模式，跳过签名文件）"
             }
           } elseif ($isArm64) {
             throw 'No Windows ARM64 MSI installer found'
@@ -391,8 +389,13 @@ jobs:
           mkdir -p release-assets
           VERSION="${TAG}"  # e.g., v3.5.0
           ARCH="${{ matrix.arch || 'x86_64' }}"
+          # ARM64 交叉编译产物在独立 target 目录下
+          BUNDLE_DIR="src-tauri/target/release/bundle"
+          if [ "$ARCH" = "arm64" ]; then
+            BUNDLE_DIR="src-tauri/target/aarch64-unknown-linux-gnu/release/bundle"
+          fi
           # Updater artifact: AppImage（含对应 .sig）
-          APPIMAGE=$(find src-tauri/target/release/bundle -name "*.AppImage" | head -1 || true)
+          APPIMAGE=$(find "$BUNDLE_DIR" -name "*.AppImage" | head -1 || true)
           if [ -n "$APPIMAGE" ]; then
             NEW_APPIMAGE="CC-Switch-${VERSION}-Linux-${ARCH}.AppImage"
             cp "$APPIMAGE" "release-assets/$NEW_APPIMAGE"
