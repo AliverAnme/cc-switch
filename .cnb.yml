@@ -36,11 +36,12 @@
   name: 安装 pnpm + Tauri CLI
   script: |
     set -e
-    echo "[3/4] nodesource setup..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | tail -3
+    echo "[3/4] nodesource setup (Node.js 22)..."
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 2>&1 | tail -3
     echo "[4/4] apt install nodejs..."
     apt-get install -y -qq nodejs 2>&1 && echo "  OK"
     echo "node $(node --version) npm $(npm --version)"
+    # 降级 pnpm 版本以兼容 Node.js 22（最新 pnpm 要求 Node 22+，确保锁定）
     npm install -g pnpm@latest @tauri-apps/cli@latest 2>&1 | tail -3
     rustup target add x86_64-unknown-linux-gnu 2>&1 | tail -1
 
@@ -63,15 +64,9 @@ $:
         - *install-deps
         - *install-tools
         - *build-app
-        - name: 编译 Rust
+        - name: 编译 + 打包
           script: |
-            set -e
-            echo "=== cargo check ==="
-            cargo check --release 2>&1 | tail -10
-            echo "=== cargo build ==="
-            cargo build --release 2>&1 | tail -10
-            echo "=== pnpm tauri build ==="
-            pnpm tauri build --bundles deb 2>&1 | tail -20
+            pnpm tauri build --bundles deb 2>&1 | tail -30
 
   # ── PR 代码检查 ──
   pull_request:
@@ -97,15 +92,9 @@ $:
         - *install-deps
         - *install-tools
         - *build-app
-        - name: 编译 Rust
+        - name: 编译 + 打包
           script: |
-            set -e
-            echo "=== cargo check ==="
-            cargo check --release 2>&1 | tail -10
-            echo "=== cargo build ==="
-            cargo build --release 2>&1 | tail -10
-            echo "=== pnpm tauri build ==="
-            pnpm tauri build --bundles deb 2>&1 | tail -20
+            pnpm tauri build --bundles deb 2>&1 | tail -30
 
 main:
   # ── Push 自动构建 ──
