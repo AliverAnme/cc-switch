@@ -966,10 +966,15 @@ fn sync_current_provider_for_app_respecting_takeover(
         .proxy_service
         .detect_takeover_in_live_config_for_app(app_type);
 
-    // `enabled` is set only after takeover writes complete. During that
-    // activation window, backup/live placeholders are the authoritative signal
-    // that normal provider sync must not rewrite the managed live file.
-    if has_live_backup || live_taken_over {
+    // For Codex/Gemini: only skip live write when proxy is actively managing the config.
+    // A stale backup (without active takeover) must NOT block the normal write path.
+    // For ClaudeDesktop: the backup IS the ownership signal (proxy config alone doesn't count).
+    let takeover_active = if matches!(app_type, AppType::ClaudeDesktop) {
+        has_live_backup || live_taken_over
+    } else {
+        live_taken_over
+    };
+    if takeover_active {
         if matches!(app_type, AppType::ClaudeDesktop) {
             write_live_with_common_config(state.db.as_ref(), app_type, provider)?;
         } else {
@@ -981,6 +986,14 @@ fn sync_current_provider_for_app_respecting_takeover(
             .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
         }
         return Ok(());
+    }
+
+    // Proxy is inactive: clean up any stale backup to avoid future confusion,
+    // then proceed with normal live write.
+    if has_live_backup {
+        let _ = futures::executor::block_on(
+            state.db.delete_live_backup(app_type.as_str()),
+        );
     }
 
     write_live_with_common_config(state.db.as_ref(), app_type, provider)

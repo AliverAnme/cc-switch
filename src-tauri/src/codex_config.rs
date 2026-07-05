@@ -216,6 +216,7 @@ pub fn write_codex_live_atomic(
         Some(s) => s.to_string(),
         None => String::new(),
     };
+
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
@@ -263,7 +264,6 @@ pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     validate_config_toml(&s)?;
     Ok(s)
 }
-
 fn active_codex_model_provider_id(doc: &DocumentMut) -> Option<String> {
     doc.get("model_provider")
         .and_then(|item| item.as_str())

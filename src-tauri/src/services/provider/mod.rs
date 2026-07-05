@@ -1896,7 +1896,13 @@ impl ProviderService {
             // Backup or live placeholders mean the live file is currently owned
             // by proxy takeover, including the short activation window before
             // proxy_config.enabled is committed.
-            let should_sync_via_proxy = has_live_backup || live_taken_over;
+            // For Codex/Gemini: use only live_taken_over (stale backup must not block).
+            // For Claude/ClaudeDesktop: keep has_live_backup as ownership signal.
+            let should_sync_via_proxy = if matches!(app_type, AppType::Codex) || matches!(app_type, AppType::Gemini) {
+                live_taken_over
+            } else {
+                has_live_backup || live_taken_over
+            };
 
             if should_sync_via_proxy {
                 if matches!(app_type, AppType::ClaudeDesktop) {
@@ -2117,7 +2123,13 @@ impl ProviderService {
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
 
-        let should_hot_switch = is_app_taken_over || live_taken_over;
+        // For Codex/Gemini: only hot-switch when proxy is actively managing the config.
+        // A stale backup (without active takeover) must NOT block the normal write path.
+        // For Claude/others: the backup IS the takeover signal.
+        let should_hot_switch = match app_type {
+            AppType::Codex | AppType::Gemini => live_taken_over,
+            _ => is_app_taken_over || live_taken_over,
+        };
 
         // Block switching to official providers when proxy takeover is active.
         // Using a proxy with official APIs (Anthropic/OpenAI/Google) may cause account bans.
@@ -2337,9 +2349,15 @@ impl ProviderService {
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
 
-        // See the save path above: backup/placeholders are the ownership signal
-        // here, not just proxy_config.enabled.
-        if has_live_backup || live_taken_over {
+        // For Codex/Gemini: only skip live write when proxy is actively managing the config.
+        // A stale backup (without active takeover) must NOT block the normal write path.
+        // For Claude/ClaudeDesktop: the backup IS the ownership signal.
+        let takeover_active = if matches!(app_type, AppType::Codex) || matches!(app_type, AppType::Gemini) {
+            live_taken_over
+        } else {
+            has_live_backup || live_taken_over
+        };
+        if takeover_active {
             if matches!(app_type, AppType::ClaudeDesktop) {
                 write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
                 return Ok(());

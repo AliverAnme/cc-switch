@@ -525,23 +525,97 @@ fn convert_message_to_openai(
     Ok(result)
 }
 
-/// 清理 JSON schema（移除不支持的 format）
+/// 清理 JSON schema（移除不支持的 format，确保 OpenAI 兼容性）。
+///
+/// # `type: "object"` 补全策略
+///
+/// OpenAI Chat Completions 的 function parameters 要求根级别必须有
+/// `type: "object"`，否则严格校验的上游（如 DeepSeek）会报
+/// `schema must be a JSON Schema of 'type: "object"', got 'type: null'`。
+/// Anthropic 允许省略 type，转换时需要补上。
+///
+/// ## 安全规则
+///
+/// 只在以下条件**全部满足**时注入 `type: "object"`：
+/// - schema 是 JSON Object 且没有 compound 关键字
+///   (`anyOf`/`oneOf`/`allOf`/`$ref`/`not`/`if`/`then`/`else`/`dependencies`)
+/// - schema 没有 `const` 或 `enum`（不幻想一个值是什么类型）
+/// - schema 没有非 `null` 的 `type` 字段
+///
+/// ## 递归范围
+///
+/// 递归进入以下关键字（它们本身都是 sub-schema）：
+/// - `properties` 值 · `items` · `additionalProperties`
+/// - `patternProperties` 值 · `$defs` 值
+/// - `allOf`/`anyOf`/`oneOf` 数组元素 · `not`/`if`/`then`/`else`
 pub fn clean_schema(mut schema: Value) -> Value {
     if let Some(obj) = schema.as_object_mut() {
-        // 移除 "format": "uri"
+        // ── 安全注入 type: "object" ──
+        // 仅在 schema 不是 compound、没有 const/enum/已有 type 时才补。
+        let has_compound = obj.contains_key("anyOf")
+            || obj.contains_key("oneOf")
+            || obj.contains_key("allOf")
+            || obj.contains_key("$ref")
+            || obj.contains_key("not")
+            || obj.contains_key("if")
+            || obj.contains_key("then")
+            || obj.contains_key("else")
+            || obj.contains_key("dependencies");
+        let has_type = match obj.get("type") {
+            Some(Value::String(s)) if !s.is_empty() => true,
+            _ => false,
+        };
+        let has_const_or_enum = obj.contains_key("const") || obj.contains_key("enum");
+        if !has_compound && !has_type && !has_const_or_enum {
+            obj.insert("type".to_string(), json!("object"));
+        }
+
+        // 移除 "format": "uri"（DeepSeek 不接受某些 format）
         if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
             obj.remove("format");
         }
 
-        // 递归清理嵌套 schema
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
+        // ── 递归清理 ──
+        // 注意：这里使用 take 代替 clone 避免不必要的分配，
+        // 但 clean_schema 外部可能仍持有旧引用，所以用 clone 安全。
+        // 内部递归保持 clone，因为编译器不能证明借用安全。
+        if let Some(props) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+            for val in props.values_mut() {
+                *val = clean_schema(val.clone());
             }
         }
-
         if let Some(items) = obj.get_mut("items") {
             *items = clean_schema(items.clone());
+        }
+        if let Some(add_props) = obj.get_mut("additionalProperties") {
+            if add_props.is_object() {
+                *add_props = clean_schema(add_props.clone());
+            }
+        }
+        if let Some(pat_props) = obj.get_mut("patternProperties").and_then(|v| v.as_object_mut()) {
+            for val in pat_props.values_mut() {
+                *val = clean_schema(val.clone());
+            }
+        }
+        if let Some(defs) = obj.get_mut("$defs").and_then(|v| v.as_object_mut()) {
+            for val in defs.values_mut() {
+                *val = clean_schema(val.clone());
+            }
+        }
+        // compound 子 schema
+        for key in &["allOf", "anyOf", "oneOf"] {
+            if let Some(arr) = obj.get_mut(*key).and_then(|v| v.as_array_mut()) {
+                for val in arr.iter_mut() {
+                    *val = clean_schema(val.clone());
+                }
+            }
+        }
+        for key in &["not", "if", "then", "else"] {
+            if let Some(sub) = obj.get_mut(*key) {
+                if sub.is_object() {
+                    *sub = clean_schema(sub.clone());
+                }
+            }
         }
     }
     schema
