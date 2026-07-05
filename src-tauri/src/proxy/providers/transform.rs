@@ -592,7 +592,10 @@ pub fn clean_schema(mut schema: Value) -> Value {
                 *add_props = clean_schema(add_props.clone());
             }
         }
-        if let Some(pat_props) = obj.get_mut("patternProperties").and_then(|v| v.as_object_mut()) {
+        if let Some(pat_props) = obj
+            .get_mut("patternProperties")
+            .and_then(|v| v.as_object_mut())
+        {
             for val in pat_props.values_mut() {
                 *val = clean_schema(val.clone());
             }

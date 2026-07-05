@@ -991,9 +991,7 @@ fn sync_current_provider_for_app_respecting_takeover(
     // Proxy is inactive: clean up any stale backup to avoid future confusion,
     // then proceed with normal live write.
     if has_live_backup {
-        let _ = futures::executor::block_on(
-            state.db.delete_live_backup(app_type.as_str()),
-        );
+        let _ = futures::executor::block_on(state.db.delete_live_backup(app_type.as_str()));
     }
 
     write_live_with_common_config(state.db.as_ref(), app_type, provider)
