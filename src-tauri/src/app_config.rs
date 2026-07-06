@@ -1035,7 +1035,9 @@ mod tests {
                 app.takeover_active(*has_backup, *live),
                 *expected,
                 "takeover_active({:?}, backup={}, live={})",
-                app, has_backup, live
+                app,
+                has_backup,
+                live
             );
         }
     }

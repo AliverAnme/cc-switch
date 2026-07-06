@@ -2426,14 +2426,16 @@ wire_api = "messages"
     let state = create_test_state_with_config(&config).expect("create test state");
 
     // Simulate a stale backup from a previously disabled takeover.
-    futures::executor::block_on(state.db.save_live_backup(
-        "codex",
-        &serde_json::to_string(&json!({
-            "auth": {},
-            "config": normal_config
-        }))
-        .expect("serialize backup"),
-    ))
+    futures::executor::block_on(
+        state.db.save_live_backup(
+            "codex",
+            &serde_json::to_string(&json!({
+                "auth": {},
+                "config": normal_config
+            }))
+            .expect("serialize backup"),
+        ),
+    )
     .expect("seed stale Codex live backup");
 
     assert!(
