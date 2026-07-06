@@ -232,27 +232,27 @@ fn infer_codex_chat_reasoning_config(
         });
     }
 
-   if haystack.contains("kimi") || haystack.contains("moonshot") {
-       return Some(CodexChatReasoningConfig {
-           supports_thinking: Some(true),
-           supports_effort: Some(true),
-           thinking_param: Some("thinking".to_string()),
-           effort_param: Some("reasoning_effort".to_string()),
-           effort_value_mode: Some("passthrough".to_string()),
-           output_format: Some("reasoning_content".to_string()),
-       });
-   }
+    if haystack.contains("kimi") || haystack.contains("moonshot") {
+        return Some(CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("passthrough".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        });
+    }
 
-   if haystack.contains("glm") || haystack.contains("zhipu") || haystack.contains("z.ai") {
-       return Some(CodexChatReasoningConfig {
-           supports_thinking: Some(true),
-           supports_effort: Some(true),
-           thinking_param: Some("thinking".to_string()),
-           effort_param: Some("reasoning_effort".to_string()),
-           effort_value_mode: Some("passthrough".to_string()),
-           output_format: Some("reasoning_content".to_string()),
-       });
-   }
+    if haystack.contains("glm") || haystack.contains("zhipu") || haystack.contains("z.ai") {
+        return Some(CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("passthrough".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        });
+    }
 
     if haystack.contains("qwen") || haystack.contains("dashscope") || haystack.contains("bailian") {
         return Some(CodexChatReasoningConfig {

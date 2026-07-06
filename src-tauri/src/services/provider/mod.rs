@@ -1897,8 +1897,7 @@ impl ProviderService {
             // by proxy takeover, including the short activation window before
             // proxy_config.enabled is committed. App-type-specific policy lives in
             // AppType::takeover_active so it can't diverge between code paths.
-            let should_sync_via_proxy =
-                app_type.takeover_active(has_live_backup, live_taken_over);
+            let should_sync_via_proxy = app_type.takeover_active(has_live_backup, live_taken_over);
 
             if should_sync_via_proxy {
                 if matches!(app_type, AppType::ClaudeDesktop) {

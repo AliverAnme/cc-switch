@@ -561,10 +561,7 @@ pub fn clean_schema(mut schema: Value) -> Value {
             || obj.contains_key("then")
             || obj.contains_key("else")
             || obj.contains_key("dependencies");
-        let has_type = match obj.get("type") {
-            Some(Value::String(s)) if !s.is_empty() => true,
-            _ => false,
-        };
+        let has_type = matches!(obj.get("type"), Some(Value::String(s)) if !s.is_empty());
         let has_const_or_enum = obj.contains_key("const") || obj.contains_key("enum");
         if !has_compound && !has_type && !has_const_or_enum {
             obj.insert("type".to_string(), json!("object"));
@@ -592,7 +589,10 @@ pub fn clean_schema(mut schema: Value) -> Value {
                 *add_props = clean_schema(add_props.clone());
             }
         }
-        if let Some(pat_props) = obj.get_mut("patternProperties").and_then(|v| v.as_object_mut()) {
+        if let Some(pat_props) = obj
+            .get_mut("patternProperties")
+            .and_then(|v| v.as_object_mut())
+        {
             for val in pat_props.values_mut() {
                 *val = clean_schema(val.clone());
             }
