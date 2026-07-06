@@ -37,3 +37,7 @@ claude-code-reverse/
 
 # CNB pipeline validator
 .agents/skills/cnb-pipeline/validator/node_modules/
+
+# CodeBuddy local tool state (skills cache + runtime memory)
+.codebuddy/
+.workbuddy/
