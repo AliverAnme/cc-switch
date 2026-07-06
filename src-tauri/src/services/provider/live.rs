@@ -966,14 +966,10 @@ fn sync_current_provider_for_app_respecting_takeover(
         .proxy_service
         .detect_takeover_in_live_config_for_app(app_type);
 
-    // For Codex/Gemini: only skip live write when proxy is actively managing the config.
-    // A stale backup (without active takeover) must NOT block the normal write path.
-    // For ClaudeDesktop: the backup IS the ownership signal (proxy config alone doesn't count).
-    let takeover_active = if matches!(app_type, AppType::ClaudeDesktop) {
-        has_live_backup || live_taken_over
-    } else {
-        live_taken_over
-    };
+    // App-type-specific takeover policy (incl. stale-backup handling for
+    // Codex/Gemini, and backup-as-signal for Claude/ClaudeDesktop) lives in
+    // AppType::takeover_active.
+    let takeover_active = app_type.takeover_active(has_live_backup, live_taken_over);
     if takeover_active {
         if matches!(app_type, AppType::ClaudeDesktop) {
             write_live_with_common_config(state.db.as_ref(), app_type, provider)?;

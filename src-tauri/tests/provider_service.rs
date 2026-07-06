@@ -2345,3 +2345,117 @@ fn recover_from_crash_without_backup_cleans_placeholder_instead_of_writing_it_ba
         "recovery must drop the local proxy base URL"
     );
 }
+
+/// Regression for fix #1/#2: a *stale* live backup left over from a previously
+/// disabled proxy takeover must NOT be treated as an active takeover for Codex.
+///
+/// Setup:
+/// - A backup exists in the DB (is_app_taken_over == true).
+/// - The proxy server is stopped AND the live config contains NO takeover
+///   placeholders (so detect_takeover_in_live_config_for_app == false).
+/// - The user switches to an `official` provider.
+///
+/// Before the fix, `should_hot_switch` was `is_app_taken_over || live_taken_over`,
+/// so the stale backup routed Codex into the hot-switch path and the
+/// `official_blocked_by_proxy` guard fired, blocking the switch entirely. After
+/// the fix (AppType::takeover_active), Codex only hot-switches when the proxy is
+/// actively managing the live config, so the switch succeeds via the normal
+/// write path and the user's full config is written to config.toml.
+#[test]
+fn stale_codex_backup_does_not_block_official_provider_switch() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    enable_codex_official_auth_preservation();
+    let _home = ensure_test_home();
+
+    // Ordinary config WITHOUT any proxy placeholder -> live_taken_over == false.
+    let normal_config = r#"model_provider = "openai"
+model = "gpt-5"
+
+[model_providers.openai]
+name = "OpenAI"
+wire_api = "responses"
+"#;
+    write_codex_live_atomic(&json!({}), Some(normal_config)).expect("seed normal Codex config");
+
+    let new_official_config = r#"model_provider = "anthropic"
+model = "claude-opus-4"
+
+[model_providers.anthropic]
+name = "Anthropic"
+wire_api = "messages"
+"#;
+
+    let mut config = MultiAppConfig::default();
+    {
+        let manager = config
+            .get_manager_mut(&AppType::Codex)
+            .expect("codex manager");
+        manager.current = "old-provider".to_string();
+
+        let mut old_provider = Provider::with_id(
+            "old-provider".to_string(),
+            "Old".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "old-key"},
+                "config": normal_config
+            }),
+            None,
+        );
+        old_provider.category = Some("custom".to_string());
+        manager
+            .providers
+            .insert("old-provider".to_string(), old_provider);
+
+        let mut new_provider = Provider::with_id(
+            "new-provider".to_string(),
+            "Anthropic Official".to_string(),
+            json!({
+                "auth": {"ANTHROPIC_API_KEY": "new-key"},
+                "config": new_official_config
+            }),
+            None,
+        );
+        // This is the provider category the takeover guard blocks.
+        new_provider.category = Some("official".to_string());
+        manager
+            .providers
+            .insert("new-provider".to_string(), new_provider);
+    }
+
+    let state = create_test_state_with_config(&config).expect("create test state");
+
+    // Simulate a stale backup from a previously disabled takeover.
+    futures::executor::block_on(state.db.save_live_backup(
+        "codex",
+        &serde_json::to_string(&json!({
+            "auth": {},
+            "config": normal_config
+        }))
+        .expect("serialize backup"),
+    ))
+    .expect("seed stale Codex live backup");
+
+    assert!(
+        !futures::executor::block_on(state.proxy_service.is_running()),
+        "fixture keeps the proxy server stopped"
+    );
+    assert!(
+        !state
+            .proxy_service
+            .detect_takeover_in_live_config_for_app(&AppType::Codex),
+        "fixture live config has no takeover placeholders"
+    );
+
+    // Must NOT return switch.official_blocked_by_proxy.
+    ProviderService::switch(&state, AppType::Codex, "new-provider")
+        .expect("stale backup must not block switching to an official provider");
+
+    // The normal write path must have written the full new provider config.
+    let live_config =
+        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    assert!(
+        live_config.contains("claude-opus-4"),
+        "switch should write the new official provider config to live config.toml"
+    );
+}

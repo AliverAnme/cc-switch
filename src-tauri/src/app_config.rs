@@ -366,6 +366,28 @@ impl AppType {
         }
     }
 
+    /// Decide whether proxy takeover is "active" for this app, given two signals:
+    ///
+    /// - `has_backup`: a live backup exists in the database (left over from a past
+    ///   takeover; may be *stale* after the proxy was deactivated).
+    /// - `live_taken_over`: the proxy is actively managing the live config right now.
+    ///
+    /// Policy (kept in one place so the app-type branching can't silently diverge
+    /// across the save / switch / sync code paths):
+    /// - `Codex` / `Gemini`: only `live_taken_over` counts. A stale backup must NOT
+    ///   block the normal write/switch path, otherwise the user's full config is
+    ///   never written and auth can get corrupted on switch.
+    /// - `Claude` / `ClaudeDesktop`: the backup IS the takeover signal (these rely on
+    ///   the backup even during the short activation window before `enabled` is committed).
+    /// - everything else (additive apps): only when the proxy is actively managing.
+    pub fn takeover_active(&self, has_backup: bool, live_taken_over: bool) -> bool {
+        match self {
+            AppType::Codex | AppType::Gemini => live_taken_over,
+            AppType::Claude | AppType::ClaudeDesktop => has_backup || live_taken_over,
+            _ => live_taken_over,
+        }
+    }
+
     /// Check if this app uses additive mode
     ///
     /// - Switch mode (false): Only the current provider is written to live config (Claude, Codex, Gemini)
@@ -976,6 +998,46 @@ mod tests {
             AppType::ClaudeDesktop
         );
         assert_eq!(AppType::ClaudeDesktop.as_str(), "claude-desktop");
+    }
+
+    /// Policy matrix for `AppType::takeover_active`. This is the single source of
+    /// truth for the app-type branching that used to be hand-inlined in 4 places
+    /// (and had silently diverged). A stale database backup must NOT count as
+    /// takeover for Codex/Gemini/OpenCode/Hermes, but DOES for Claude/ClaudeDesktop.
+    #[test]
+    fn takeover_active_policy_matrix() {
+        // (app, has_backup, live_taken_over) -> expected
+        let cases: &[(AppType, bool, bool, bool)] = &[
+            // Codex: stale backup alone must NOT activate takeover.
+            (AppType::Codex, true, false, false),
+            (AppType::Codex, false, false, false),
+            (AppType::Codex, true, true, true),
+            (AppType::Codex, false, true, true),
+            // Gemini: same as Codex.
+            (AppType::Gemini, true, false, false),
+            (AppType::Gemini, false, true, true),
+            // Claude: backup IS the takeover signal (stale backup activates it).
+            (AppType::Claude, true, false, true),
+            (AppType::Claude, false, false, false),
+            (AppType::Claude, false, true, true),
+            // ClaudeDesktop: same as Claude.
+            (AppType::ClaudeDesktop, true, false, true),
+            (AppType::ClaudeDesktop, false, true, true),
+            // Additive apps: only an actively-managed live config counts.
+            (AppType::OpenCode, true, false, false),
+            (AppType::OpenCode, false, true, true),
+            (AppType::OpenClaw, true, false, false),
+            (AppType::Hermes, true, false, false),
+            (AppType::Hermes, false, true, true),
+        ];
+        for (app, has_backup, live, expected) in cases {
+            assert_eq!(
+                app.takeover_active(*has_backup, *live),
+                *expected,
+                "takeover_active({:?}, backup={}, live={})",
+                app, has_backup, live
+            );
+        }
     }
 
     struct TempHome {
