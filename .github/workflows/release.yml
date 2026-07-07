@@ -48,6 +48,7 @@ jobs:
 
   release:
     runs-on: ${{ matrix.os }}
+    environment: release
     needs: resolve-version
     strategy:
       fail-fast: false

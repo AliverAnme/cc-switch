@@ -28,7 +28,6 @@ flatpak-repo/
 copilot-api
 .history
 CODEBUDDY.md
-.github
 mainWindow.js
 # Local Pi runtime state
 .atl/
