@@ -1031,6 +1031,7 @@ fn build_gateway_profile(
         // 功能开关：开启 Claude Desktop 的代码执行、自动模式、聊天标签页与高级文件分析，
         // 并关闭遥测与非必要服务，与本地 reasoning_effort 注入等增强配合，
         // 最大化第三方网关下的可用性。
+        "isDesktopExtensionEnabled": true,
         "chatCodeExecutionEnabled": true,
         "autoModeEnabled": true,
         "chatTabEnabled": true,
