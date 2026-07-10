@@ -455,19 +455,19 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
 
     match mode.unwrap_or("passthrough") {
         "deepseek" => match effort.as_str() {
-            "max" | "xhigh" => Some("max"),
+            "ultra" | "max" | "xhigh" => Some("max"),
             _ => Some("high"),
         },
         "low_high" => match effort.as_str() {
             "minimal" | "low" => Some("low"),
             _ => Some("high"),
         },
-        // OpenRouter effort 枚举为 xhigh|high|medium|low|minimal（无 max）。max 是
+        // OpenRouter effort 枚举为 xhigh|high|medium|low|minimal（无 max/ultra）。max 和 ultra 是
         // Codex / 部分模型的扩展档位，对 OpenRouter 非法，会触发
         // `400 reasoning_effort: Invalid option`（见 openclaw#77350）；钳到最高合法档
         // xhigh，其余合法值透传，未知值丢弃以免被上游拒绝。
         "openrouter" => match effort.as_str() {
-            "max" | "xhigh" => Some("xhigh"),
+            "ultra" | "max" | "xhigh" => Some("xhigh"),
             "high" => Some("high"),
             "medium" => Some("medium"),
             "low" => Some("low"),
@@ -481,6 +481,7 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "high" => Some("high"),
             "xhigh" => Some("xhigh"),
             "max" => Some("max"),
+            "ultra" => Some("max"),
             _ => None,
         },
     }
