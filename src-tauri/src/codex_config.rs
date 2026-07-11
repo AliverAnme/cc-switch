@@ -448,12 +448,14 @@ fn codex_catalog_model_entry(
     entry_obj.insert("context_window".to_string(), json!(spec.context_window));
     entry_obj.insert("max_context_window".to_string(), json!(spec.context_window));
     entry_obj.insert("priority".to_string(), json!(1000 + priority));
-    entry_obj.insert("additional_speed_tiers".to_string(), json!([]));
-    entry_obj.insert("service_tiers".to_string(), json!([]));
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
 
     if profile != CodexCatalogToolProfile::ProxyChat {
+        // Native `/responses` and Anthropic gateways don't support speed/service tiers
+        entry_obj.insert("additional_speed_tiers".to_string(), json!([]));
+        entry_obj.insert("service_tiers".to_string(), json!([]));
+
         // Native `/responses` and Anthropic gateways reject / drop Codex's freeform
         // `apply_patch` (type=="custom") tool. Strip any key that would make Codex
         // emit a custom/freeform tool, and rely on shell_type="shell_command" for
@@ -2499,8 +2501,13 @@ base_url = "https://production.api/v1"
         );
         assert_eq!(
             models[0].get("additional_speed_tiers"),
-            Some(&json!([])),
-            "generated third-party entries should not inherit OpenAI speed tiers"
+            template.get("additional_speed_tiers"),
+            "proxy-chat entries should inherit the template's speed tiers"
+        );
+        assert_eq!(
+            models[0].get("service_tiers"),
+            template.get("service_tiers"),
+            "proxy-chat entries should inherit the template's service tiers"
         );
         assert!(
             models[0]
