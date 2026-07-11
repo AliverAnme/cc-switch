@@ -52,3 +52,4 @@ CLIProxyAPI/
 
 # Independent plugins workspace (contains its own .git)
 plugins/
+chatgpt-desktop-analysis/
