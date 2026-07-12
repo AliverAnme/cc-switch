@@ -308,6 +308,10 @@ pub fn responses_to_chat_completions_with_reasoning(
 
     apply_reasoning_options(&mut result, &body, model, reasoning_config);
 
+    if let Some(response_format) = responses_text_format_to_chat_response_format(&body) {
+        result["response_format"] = response_format;
+    }
+
     let tools = tool_context.chat_tools();
     if !tools.is_empty() {
         result["tools"] = json!(tools);
@@ -344,6 +348,21 @@ pub fn responses_to_chat_completions_with_reasoning(
     super::transform::inject_openai_stream_include_usage(&mut result);
 
     Ok(result)
+}
+
+fn responses_text_format_to_chat_response_format(body: &Value) -> Option<Value> {
+    let format = body.pointer("/text/format")?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    Some(json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": format.get("name").and_then(Value::as_str).unwrap_or("responses_output"),
+            "strict": format.get("strict").and_then(Value::as_bool).unwrap_or(true),
+            "schema": format.get("schema")?.clone()
+        }
+    }))
 }
 
 fn apply_reasoning_options(
@@ -1972,6 +1991,35 @@ mod tests {
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
         assert_eq!(result["max_tokens"], 100);
         assert_eq!(result["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_text_format_maps_to_chat_response_format() {
+        let request = json!({
+            "model": "gpt-5",
+            "input": "Extract a person.",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "person",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+
+        let result = responses_to_chat_completions(request).unwrap();
+        assert_eq!(result["response_format"]["type"], "json_schema");
+        assert_eq!(result["response_format"]["json_schema"]["name"], "person");
+        assert_eq!(
+            result["response_format"]["json_schema"]["schema"]["required"][0],
+            "name"
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@
 use super::gemini_schema::build_gemini_function_declaration;
 use super::gemini_shadow::{GeminiAssistantTurn, GeminiShadowStore, GeminiToolCallMeta};
 use crate::proxy::error::ProxyError;
+use crate::proxy::providers::usage_core::{
+    build_anthropic_usage_with_output, empty_usage, RawTokens,
+};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -220,6 +223,46 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
             continue;
         }
 
+        // Gemini can return generated images and other binary media as base64
+        // `inlineData`. Anthropic image blocks only accept image MIME types;
+        // never relabel audio/PDF/etc. as an image because that yields an
+        // invalid Anthropic response.
+        if let Some(inline_data) = part
+            .get("inlineData")
+            .or_else(|| part.get("inline_data"))
+            .filter(|value| value.is_object())
+        {
+            let media_type = inline_data
+                .get("mimeType")
+                .or_else(|| inline_data.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            let data = inline_data
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !data.is_empty()
+                && matches!(
+                    media_type,
+                    "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+                )
+            {
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data
+                    }
+                }));
+            } else if !data.is_empty() {
+                return Err(ProxyError::TransformError(format!(
+                    "Gemini returned inline response media `{media_type}` which cannot be represented by Anthropic Messages"
+                )));
+            }
+            continue;
+        }
+
         if let Some(function_call) = part.get("functionCall") {
             has_tool_use = true;
             let id = function_call
@@ -337,6 +380,7 @@ fn collect_system_texts(value: &Value, texts: &mut Vec<String>) -> Result<(), Pr
 
 fn build_generation_config(body: &Value) -> Option<Value> {
     let mut config = Map::new();
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
 
     if let Some(value) = body.get("max_tokens") {
         config.insert("maxOutputTokens".to_string(), value.clone());
@@ -347,14 +391,85 @@ fn build_generation_config(body: &Value) -> Option<Value> {
     if let Some(value) = body.get("top_p") {
         config.insert("topP".to_string(), value.clone());
     }
+    if let Some(value) = body.get("top_k") {
+        config.insert("topK".to_string(), value.clone());
+    }
     if let Some(value) = body.get("stop_sequences") {
         config.insert("stopSequences".to_string(), value.clone());
+    }
+    // Claude structured outputs and Gemini's responseJsonSchema both express
+    // a JSON-schema constrained response.  Keep the schema as a structured
+    // field instead of degrading it into prompt text.
+    if body
+        .pointer("/output_config/format/type")
+        .and_then(Value::as_str)
+        == Some("json_schema")
+    {
+        if let Some(schema) = body.pointer("/output_config/format/schema") {
+            config.insert("responseJsonSchema".to_string(), schema.clone());
+        }
+    }
+
+    // Gemini exposes two generations of thinking controls.  The model mapping
+    // has already run before this converter, so only emit the control known to
+    // match the selected upstream family: Gemini 2.5 uses token budgets, while
+    // Gemini 3+ uses reasoning levels.  Unknown families remain untouched.
+    if is_gemini_model(model) {
+        if is_gemini_3_or_later(model) {
+            if let Some(level) = anthropic_effort_to_gemini_thinking_level(body) {
+                config.insert(
+                    "thinkingConfig".to_string(),
+                    json!({ "thinkingLevel": level }),
+                );
+            }
+        } else if let Some(budget) = body
+            .pointer("/thinking/budget_tokens")
+            .and_then(Value::as_u64)
+            .filter(|budget| *budget > 0)
+        {
+            config.insert(
+                "thinkingConfig".to_string(),
+                json!({ "thinkingBudget": budget }),
+            );
+        }
     }
 
     if config.is_empty() {
         None
     } else {
         Some(Value::Object(config))
+    }
+}
+
+fn is_gemini_model(model: &str) -> bool {
+    model
+        .trim_start_matches("models/")
+        .to_ascii_lowercase()
+        .starts_with("gemini-")
+}
+
+fn is_gemini_3_or_later(model: &str) -> bool {
+    model
+        .trim_start_matches("models/")
+        .to_ascii_lowercase()
+        .starts_with("gemini-3")
+}
+
+fn anthropic_effort_to_gemini_thinking_level(body: &Value) -> Option<&'static str> {
+    let effort = body
+        .pointer("/output_config/effort")
+        .and_then(Value::as_str)
+        .or_else(
+            || match body.pointer("/thinking/type").and_then(Value::as_str) {
+                Some("adaptive") => Some("high"),
+                _ => None,
+            },
+        )?;
+    match effort {
+        "low" => Some("LOW"),
+        "medium" => Some("MEDIUM"),
+        "high" | "xhigh" | "max" => Some("HIGH"),
+        _ => None,
     }
 }
 
@@ -622,18 +737,29 @@ fn convert_message_content_to_parts(
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
 
-                if source_type != "base64" {
-                    return Err(ProxyError::TransformError(format!(
-                        "Gemini Native only supports base64 document sources, got `{source_type}`"
-                    )));
-                }
-
-                parts.push(json!({
-                    "inlineData": {
-                        "mimeType": source.get("media_type").and_then(|value| value.as_str()).unwrap_or("application/pdf"),
-                        "data": source.get("data").and_then(|value| value.as_str()).unwrap_or("")
+                match source_type {
+                    "base64" => {
+                        parts.push(json!({
+                            "inlineData": {
+                                "mimeType": source.get("media_type").and_then(|value| value.as_str()).unwrap_or("application/pdf"),
+                                "data": source.get("data").and_then(|value| value.as_str()).unwrap_or("")
+                            }
+                        }));
                     }
-                }));
+                    "text" => {
+                        if let Some(text) = source.get("data").and_then(Value::as_str) {
+                            parts.push(json!({ "text": text }));
+                        }
+                    }
+                    "content" => {
+                        append_document_content_text(source.get("content"), &mut parts);
+                    }
+                    _ => {
+                        return Err(ProxyError::TransformError(format!(
+                            "Gemini Native cannot represent document source `{source_type}` without an uploaded Google file URI"
+                        )));
+                    }
+                }
             }
             "tool_use" => {
                 if role != "assistant" {
@@ -722,6 +848,20 @@ fn convert_message_content_to_parts(
     }
 
     Ok(parts)
+}
+
+fn append_document_content_text(content: Option<&Value>, parts: &mut Vec<Value>) {
+    match content {
+        Some(Value::String(text)) => parts.push(json!({ "text": text })),
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    parts.push(json!({ "text": text }));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_tool_result_response(content: Option<&Value>) -> Value {
@@ -1100,10 +1240,7 @@ fn map_tool_choice(tool_choice: Option<&Value>) -> Result<Option<Value>, ProxyEr
 /// transform path so the two emit identical shapes.
 pub(crate) fn build_anthropic_usage(usage: Option<&Value>) -> Value {
     let Some(usage) = usage else {
-        return json!({
-            "input_tokens": 0,
-            "output_tokens": 0
-        });
+        return empty_usage();
     };
 
     let prompt_tokens = usage
@@ -1118,25 +1255,22 @@ pub(crate) fn build_anthropic_usage(usage: Option<&Value>) -> Value {
         .get("cachedContentTokenCount")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    // Gemini 的 promptTokenCount 含缓存命中（cachedContentTokenCount）；而 Anthropic
-    // 语义下 input_tokens 必须是不含 cache 的 fresh input、cache_read 单列。本路径转成
-    // Anthropic 后以 app_type=claude 记账，calculator 对 claude 设 input_includes_cache_read
-    // =false 不再从 input 扣 cache，因此这里必须先扣减，否则缓存 token 会被双重计费
-    // （一次按完整 input 价、一次按 cache_read 价）。output 仍按 total-prompt 计算
-    // （prompt 是总输入，扣减只作用于 input/cache 的拆分，不影响 output）。
-    let input_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    let reasoning_tokens = usage
+        .get("thoughtsTokenCount")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    // output = total - prompt (prompt 含 cache，故扣减不影响 output 金额)
     let output_tokens = total_tokens.saturating_sub(prompt_tokens);
 
-    let mut result = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens
-    });
-
-    if cached_tokens > 0 {
-        result["cache_read_input_tokens"] = json!(cached_tokens);
-    }
-
-    result
+    build_anthropic_usage_with_output(
+        RawTokens {
+            prompt_tokens,
+            cache_read: cached_tokens,
+            cache_creation: 0,
+            reasoning_tokens,
+        },
+        output_tokens,
+    )
 }
 
 fn map_finish_reason(reason: Option<&str>, has_tool_use: bool) -> Value {
@@ -1189,6 +1323,73 @@ mod tests {
         assert_eq!(result["contents"][0]["role"], "user");
         assert_eq!(result["contents"][0]["parts"][0]["text"], "Hello");
         assert_eq!(result["generationConfig"]["maxOutputTokens"], 128);
+    }
+
+    #[test]
+    fn anthropic_structured_output_maps_to_gemini_response_json_schema() {
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{ "role": "user", "content": "Extract a person." }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(
+            result["generationConfig"]["responseJsonSchema"]["required"][0],
+            "name"
+        );
+    }
+
+    #[test]
+    fn anthropic_top_k_maps_to_gemini_top_k() {
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "top_k": 32
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(result["generationConfig"]["topK"], 32);
+    }
+
+    #[test]
+    fn anthropic_thinking_budget_maps_only_to_gemini_2_x() {
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "thinking": { "type": "enabled", "budget_tokens": 8192 }
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(
+            result["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            8192
+        );
+    }
+
+    #[test]
+    fn anthropic_effort_maps_to_gemini_3_thinking_level() {
+        let input = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [{ "role": "user", "content": "Hello" }],
+            "output_config": { "effort": "xhigh" }
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(
+            result["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
     }
 
     #[test]
@@ -1264,6 +1465,26 @@ mod tests {
             result["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
             "get_weather"
         );
+    }
+
+    #[test]
+    fn anthropic_plain_and_content_documents_map_to_gemini_text_parts() {
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "plain document"}},
+                    {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]}}
+                ]
+            }]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        let parts = &result["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "plain document");
+        assert_eq!(parts[1]["text"], "first");
+        assert_eq!(parts[2]["text"], "second");
     }
 
     #[test]
@@ -1393,6 +1614,22 @@ mod tests {
     }
 
     #[test]
+    fn gemini_usage_preserves_thinking_token_breakdown() {
+        let usage = json!({
+            "promptTokenCount": 100,
+            "cachedContentTokenCount": 40,
+            "totalTokenCount": 160,
+            "thoughtsTokenCount": 24
+        });
+
+        let result = build_anthropic_usage(Some(&usage));
+        assert_eq!(result["input_tokens"], 60);
+        assert_eq!(result["output_tokens"], 60);
+        assert_eq!(result["cache_read_input_tokens"], 40);
+        assert_eq!(result["output_tokens_details"]["thinking_tokens"], 24);
+    }
+
+    #[test]
     fn gemini_to_anthropic_maps_function_calls_to_tool_use() {
         let input = json!({
             "responseId": "resp_2",
@@ -1419,6 +1656,47 @@ mod tests {
         assert_eq!(result["content"][0]["type"], "tool_use");
         assert_eq!(result["content"][0]["id"], "call_1");
         assert_eq!(result["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn gemini_inline_image_maps_to_anthropic_image_block() {
+        let input = json!({
+            "responseId": "resp_image",
+            "modelVersion": "gemini-3.1-flash-image-preview",
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{
+                    "inlineData": { "mimeType": "image/png", "data": "aW1hZ2U=" }
+                }]}
+            }],
+            "usageMetadata": { "promptTokenCount": 1, "totalTokenCount": 2 }
+        });
+
+        let result = gemini_to_anthropic(input).unwrap();
+        assert_eq!(result["content"][0]["type"], "image");
+        assert_eq!(result["content"][0]["source"]["media_type"], "image/png");
+        assert_eq!(result["content"][0]["source"]["data"], "aW1hZ2U=");
+    }
+
+    #[test]
+    fn gemini_inline_non_image_returns_explicit_transform_error() {
+        let input = json!({
+            "responseId": "resp_audio",
+            "modelVersion": "gemini-2.5-pro",
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{
+                    "inlineData": { "mimeType": "audio/wav", "data": "YXVkaW8=" }
+                }]}
+            }],
+            "usageMetadata": { "promptTokenCount": 1, "totalTokenCount": 2 }
+        });
+
+        let error =
+            gemini_to_anthropic(input).expect_err("audio cannot be represented as Anthropic image");
+        assert!(error
+            .to_string()
+            .contains("cannot be represented by Anthropic Messages"));
     }
 
     #[test]

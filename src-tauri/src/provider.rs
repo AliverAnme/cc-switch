@@ -480,6 +480,16 @@ pub struct ProviderMeta {
     /// identity when available; generated session IDs are not sent upstream.
     #[serde(rename = "promptCacheKey", skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
+    /// Optional OpenAI Responses prompt-cache retention policy.
+    ///
+    /// This is deliberately opt-in: Anthropic's `cache_control` breakpoints and
+    /// OpenAI's cache retention are not equivalent, and automatically upgrading
+    /// a request to extended retention may have cost implications.
+    #[serde(
+        rename = "promptCacheRetention",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_cache_retention: Option<String>,
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,

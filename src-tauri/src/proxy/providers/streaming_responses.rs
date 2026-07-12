@@ -179,9 +179,14 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                 // Some() wrapper ensures build function always receives valid input
                                 // Fallback to empty object {} if usage field missing, ensuring message_start
                                 // event always has valid usage structure for VSCode Extension compatibility
-                                let start_usage = build_anthropic_usage_from_responses(
+                                let mut start_usage = build_anthropic_usage_from_responses(
                                     Some(response_obj.get("usage").unwrap_or(&json!({}))),
                                 );
+                                // `message_start` carries input-side usage only. Some
+                                // OpenAI-compatible gateways include final usage in
+                                // response.created, but output accounting belongs to the
+                                // terminal message_delta.
+                                start_usage["output_tokens"] = json!(0);
 
                                 let event = json!({
                                     "type": "message_start",
@@ -868,6 +873,40 @@ mod tests {
         assert!(merged.contains("\"input_tokens\":12"));
         assert!(merged.contains("\"output_tokens\":3"));
         assert!(merged.contains("\"type\":\"message_stop\""));
+    }
+
+    #[tokio::test]
+    async fn test_message_start_zeros_premature_responses_output_usage() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_early_usage\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":25}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":25}}}\n\n"
+        );
+
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(input))]);
+        let chunks: Vec<_> = create_anthropic_sse_stream_from_responses(upstream)
+            .collect()
+            .await;
+        let merged = chunks
+            .into_iter()
+            .map(|chunk| String::from_utf8_lossy(chunk.unwrap().as_ref()).to_string())
+            .collect::<String>();
+        let message_start = merged
+            .split("\n\n")
+            .find(|event| event.starts_with("event: message_start\n"))
+            .expect("should emit message_start");
+        let json = message_start
+            .strip_prefix("event: message_start\ndata: ")
+            .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            .expect("message_start should contain JSON");
+
+        assert_eq!(
+            json.pointer("/message/usage/output_tokens"),
+            Some(&json!(0))
+        );
+        assert!(merged.contains("\"type\":\"message_delta\""));
+        assert!(merged.contains("\"output_tokens\":25"));
     }
 
     #[tokio::test]

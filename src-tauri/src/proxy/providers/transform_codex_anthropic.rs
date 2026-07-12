@@ -316,6 +316,18 @@ pub fn responses_request_to_anthropic(
         });
     }
 
+    // Responses `text.format` and Anthropic `output_config.format` both use a
+    // JSON Schema constrained-output contract.  Merge this with an existing
+    // effort configuration instead of replacing it.
+    if let Some(format) = responses_text_format_to_anthropic_output_format(&body) {
+        let output_config = result
+            .as_object_mut()
+            .expect("conversion result is always an object")
+            .entry("output_config".to_string())
+            .or_insert_with(|| json!({}));
+        output_config["format"] = format;
+    }
+
     if !thinking_enabled {
         if let Some(v) = body.get("temperature") {
             result["temperature"] = v.clone();
@@ -386,6 +398,17 @@ pub fn responses_request_to_anthropic(
     }
 
     Ok(result)
+}
+
+fn responses_text_format_to_anthropic_output_format(body: &Value) -> Option<Value> {
+    let format = body.pointer("/text/format")?;
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    Some(json!({
+        "type": "json_schema",
+        "schema": format.get("schema")?.clone()
+    }))
 }
 
 fn chat_tool_to_anthropic_tool(chat_tool: &Value) -> Option<Value> {
@@ -1307,6 +1330,37 @@ mod tests {
         assert_eq!(result["messages"][0]["role"], "user");
         assert_eq!(result["messages"][0]["content"][0]["type"], "text");
         assert_eq!(result["messages"][0]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_request_responses_text_format_maps_to_anthropic_output_config() {
+        let request = json!({
+            "model": "claude-sonnet-4-6",
+            "input": "Extract a person.",
+            "max_output_tokens": 1024,
+            "reasoning": { "effort": "medium" },
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "person",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        });
+
+        let result = responses_request_to_anthropic(request, 8192).unwrap();
+        assert_eq!(result["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(
+            result["output_config"]["format"]["schema"]["required"][0],
+            "name"
+        );
+        assert_eq!(result["output_config"]["effort"], "medium");
     }
 
     #[test]

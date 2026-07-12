@@ -220,6 +220,8 @@ export interface ProviderMeta {
   isFullUrl?: boolean;
   // Prompt cache key for OpenAI Responses-compatible endpoints (improves cache hit rate)
   promptCacheKey?: string;
+  // OpenAI Responses cache retention. Explicit opt-in because it is not equivalent to Anthropic cache_control.
+  promptCacheRetention?: "in_memory" | "24h";
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
   // Codex Responses -> Chat Completions reasoning capability metadata

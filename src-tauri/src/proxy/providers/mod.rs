@@ -35,6 +35,7 @@ pub mod transform_codex_anthropic;
 pub mod transform_codex_chat;
 pub mod transform_gemini;
 pub mod transform_responses;
+pub(crate) mod usage_core;
 
 use crate::app_config::AppType;
 use crate::provider::Provider;

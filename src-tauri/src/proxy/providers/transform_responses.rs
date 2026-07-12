@@ -8,8 +8,28 @@
 //! - system prompt 使用 `instructions` 字段而非 system role message
 //! - usage 字段命名与 Anthropic 一致 (input_tokens/output_tokens)
 
+use crate::proxy::providers::usage_core::{
+    build_anthropic_usage_with_output, empty_usage, RawTokens,
+};
 use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
 use serde_json::{json, Value};
+
+/// Applies an OpenAI Responses cache-retention policy when it is both explicit
+/// and valid.  Unknown values are ignored rather than forwarded to strict
+/// OpenAI-compatible gateways.
+pub(crate) fn apply_prompt_cache_retention(result: &mut Value, retention: Option<&str>) {
+    let Some(retention) = retention.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    if matches!(retention, "in_memory" | "24h") {
+        result["prompt_cache_retention"] = json!(retention);
+    } else {
+        log::warn!(
+            "[Transform] ignoring unsupported OpenAI prompt_cache_retention `{retention}`; expected `in_memory` or `24h`"
+        );
+    }
+}
 
 pub(crate) fn sanitize_anthropic_tool_use_input(name: &str, input: Value) -> Value {
     if name != "Read" {
@@ -54,6 +74,7 @@ pub fn anthropic_to_responses(
     is_codex_oauth: bool,
     codex_fast_mode: bool,
 ) -> Result<Value, ProxyError> {
+    super::transform::log_anthropic_lossy_features(&body, "openai_responses");
     let mut result = json!({});
 
     // NOTE: 模型映射由上游统一处理（proxy::model_mapper），格式转换层只做结构转换。
@@ -111,6 +132,11 @@ pub fn anthropic_to_responses(
         }
     }
 
+    if let Some(format) = super::transform::anthropic_output_format_to_responses_text_format(&body)
+    {
+        result["text"] = json!({ "format": format });
+    }
+
     // stop_sequences → 丢弃 (Responses API 不支持)
 
     // 转换 tools (过滤 BatchTool)
@@ -119,14 +145,25 @@ pub fn anthropic_to_responses(
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
             .map(|t| {
-                json!({
+                let mut tool = json!({
                     "type": "function",
                     "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
                     "description": t.get("description"),
                     "parameters": super::transform::clean_schema(
                         t.get("input_schema").cloned().unwrap_or(json!({}))
                     )
-                })
+                });
+                if t.get("strict").and_then(Value::as_bool) == Some(true) {
+                    if super::transform::openai_strict_schema_compatible(&tool["parameters"]) {
+                        tool["strict"] = json!(true);
+                    } else {
+                        log::warn!(
+                            "[Transform] tool `{}` schema is not compatible with OpenAI strict mode; forwarding without strict",
+                            t.get("name").and_then(Value::as_str).unwrap_or("")
+                        );
+                    }
+                }
+                tool
             })
             .collect();
 
@@ -142,6 +179,21 @@ pub fn anthropic_to_responses(
     // Inject prompt_cache_key for improved cache routing on OpenAI-compatible endpoints
     if let Some(key) = cache_key {
         result["prompt_cache_key"] = json!(key);
+    }
+
+    // Anthropic's metadata.user_id is its stable per-end-user identifier.
+    // Responses exposes the equivalent safety_identifier.  Preserve it for
+    // normal Responses backends, but omit it for the Codex OAuth endpoint whose
+    // accepted request schema is intentionally narrower.
+    if !is_codex_oauth {
+        if let Some(user_id) = body
+            .pointer("/metadata/user_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            result["safety_identifier"] = json!(user_id);
+        }
     }
 
     // Codex OAuth (ChatGPT Plus/Pro 反代) 特殊协议约束：
@@ -271,25 +323,15 @@ pub(crate) fn map_responses_stop_reason(
 pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Value {
     let u = match usage {
         Some(v) if !v.is_null() && v.is_object() => v,
-        _ => {
-            return json!({
-                "input_tokens": 0,
-                "output_tokens": 0
-            })
-        }
+        _ => return empty_usage(),
     };
 
-    // Detect empty object {} and log warning
     if u.as_object().map(|obj| obj.is_empty()).unwrap_or(false) {
         log::warn!("[Responses] Empty usage object received, using defaults");
-        return json!({
-            "input_tokens": 0,
-            "output_tokens": 0
-        });
+        return empty_usage();
     }
 
-    // Extract input_tokens with OpenAI field name fallback
-    // Priority: input_tokens (Anthropic) → prompt_tokens (OpenAI) → 0
+    // Extract input_tokens (Anthropic priority) with OpenAI fallback
     let input = u
         .get("input_tokens")
         .and_then(|v| v.as_u64())
@@ -304,8 +346,6 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
         })
         .unwrap_or(0);
 
-    // Extract output_tokens with OpenAI field name fallback
-    // Priority: output_tokens (Anthropic) → completion_tokens (OpenAI) → 0
     let output = u.get("output_tokens")
         .and_then(|v| v.as_u64())
         .or_else(|| {
@@ -317,62 +357,43 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
         })
         .unwrap_or(0);
 
-    // Log if only one field present (partial object). Streaming chunks legitimately
-    // arrive with partial usage, so this stays at debug level to avoid noise.
     if (input == 0 && output > 0) || (input > 0 && output == 0) {
         log::debug!("[Responses] Partial usage object: {:?}", u);
     }
 
-    let mut result = json!({
-        "input_tokens": input,
-        "output_tokens": output
-    });
-
-    // Step 1: OpenAI nested details as fallback for cache tokens
-    // OpenAI Responses API: input_tokens_details.cached_tokens
-    if let Some(cached) = u
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        result["cache_read_input_tokens"] = json!(cached);
-    }
-    // OpenAI standard: prompt_tokens_details.cached_tokens
-    if let Some(cached) = u
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(|v| v.as_u64())
-    {
-        if result.get("cache_read_input_tokens").is_none() {
-            result["cache_read_input_tokens"] = json!(cached);
-        }
-    }
-
-    // Step 2: Direct Anthropic-style fields override (authoritative if present)
-    // These preserve cache tokens even if input/output_tokens are missing
-    if let Some(v) = u.get("cache_read_input_tokens") {
-        result["cache_read_input_tokens"] = v.clone();
-    }
-    if let Some(v) = u.get("cache_creation_input_tokens") {
-        result["cache_creation_input_tokens"] = v.clone();
-    }
-
-    // OpenAI/Responses 的 input(prompt_tokens/input_tokens)含缓存命中，Anthropic input_tokens 不含
-    // → 减去 cache_read 与 cache_creation，使其成为 fresh input。本函数在计量意义上是 claude 专属
-    // （Codex Responses 透传走 from_codex_response_*，不调用本函数），故可安全在此扣减。三桶互斥，
-    // 恒等：input + cache_read + cache_creation == 上游 input(inclusive)。与 build_anthropic_usage_json
-    // (#2774) 及 transform_gemini 的 saturating_sub 对称；一处同时覆盖非流式与流式(streaming_responses)。
-    let cached = result
-        .get("cache_read_input_tokens")
+    let reasoning_tokens = u
+        .pointer("/output_tokens_details/reasoning_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let cache_creation = result
+
+    // Cache token priority: direct Anthropic fields override nested OpenAI fields
+    let cache_read = u
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            u.pointer("/input_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .or_else(|| {
+            u.pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+
+    let cache_creation = u
         .get("cache_creation_input_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if cached > 0 || cache_creation > 0 {
-        result["input_tokens"] = json!(input.saturating_sub(cached).saturating_sub(cache_creation));
-    }
 
-    result
+    build_anthropic_usage_with_output(
+        RawTokens {
+            prompt_tokens: input,
+            cache_read,
+            cache_creation,
+            reasoning_tokens,
+        },
+        output,
+    )
 }
 
 /// 将 Anthropic messages 数组转换为 Responses API input 数组
@@ -425,17 +446,119 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                         }
 
                         "image" => {
-                            if let Some(source) = block.get("source") {
-                                let media_type = source
-                                    .get("media_type")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("image/png");
-                                let data =
-                                    source.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                                message_content.push(json!({
-                                    "type": "input_image",
-                                    "image_url": format!("data:{media_type};base64,{data}")
-                                }));
+                            let source = block.get("source").ok_or_else(|| {
+                                ProxyError::TransformError(
+                                    "OpenAI Responses image block missing source".into(),
+                                )
+                            })?;
+                            let image_url = match source.get("type").and_then(Value::as_str) {
+                                Some("url") => source
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        ProxyError::TransformError(
+                                            "OpenAI Responses image URL source missing url".into(),
+                                        )
+                                    })?
+                                    .to_string(),
+                                Some("base64") => {
+                                    let media_type = source
+                                        .get("media_type")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("image/png");
+                                    let data = source
+                                        .get("data")
+                                        .and_then(|d| d.as_str())
+                                        .ok_or_else(|| {
+                                            ProxyError::TransformError(
+                                                "OpenAI Responses base64 image source missing data"
+                                                    .into(),
+                                            )
+                                        })?;
+                                    format!("data:{media_type};base64,{data}")
+                                }
+                                other => {
+                                    return Err(ProxyError::TransformError(format!(
+                                        "OpenAI Responses cannot represent Anthropic image source `{}`",
+                                        other.unwrap_or("missing")
+                                    )));
+                                }
+                            };
+                            message_content.push(json!({
+                                "type": "input_image",
+                                "image_url": image_url
+                            }));
+                        }
+
+                        "document" => {
+                            let source = block.get("source").ok_or_else(|| {
+                                ProxyError::TransformError(
+                                    "OpenAI Responses document block missing source".into(),
+                                )
+                            })?;
+                            match source.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(text) = source.get("data").and_then(Value::as_str) {
+                                        let content_type = if role == "assistant" {
+                                            "output_text"
+                                        } else {
+                                            "input_text"
+                                        };
+                                        message_content
+                                            .push(json!({ "type": content_type, "text": text }));
+                                    }
+                                }
+                                Some("content") => {
+                                    append_anthropic_document_content_as_responses_text(
+                                        source.get("content"),
+                                        role,
+                                        &mut message_content,
+                                    );
+                                }
+                                Some("base64") | Some("url") => {
+                                    let mut file = serde_json::Map::new();
+                                    if source.get("type").and_then(Value::as_str) == Some("url") {
+                                        file.insert(
+                                            "file_url".to_string(),
+                                            source
+                                                .get("url")
+                                                .cloned()
+                                                .ok_or_else(|| {
+                                                    ProxyError::TransformError(
+                                                        "OpenAI Responses document URL source missing url"
+                                                            .into(),
+                                                    )
+                                                })?,
+                                        );
+                                    } else {
+                                        file.insert(
+                                            "file_data".to_string(),
+                                            source
+                                                .get("data")
+                                                .cloned()
+                                                .ok_or_else(|| {
+                                                    ProxyError::TransformError(
+                                                        "OpenAI Responses base64 document source missing data"
+                                                            .into(),
+                                                    )
+                                                })?,
+                                        );
+                                    }
+                                    if let Some(title) = block.get("title").and_then(Value::as_str)
+                                    {
+                                        file.insert("filename".to_string(), json!(title));
+                                    }
+                                    let mut input_file = serde_json::Map::new();
+                                    input_file.insert("type".to_string(), json!("input_file"));
+                                    input_file.extend(file);
+                                    message_content.push(Value::Object(input_file));
+                                }
+                                other => {
+                                    return Err(ProxyError::TransformError(format!(
+                                        "OpenAI Responses cannot represent Anthropic document source `{}` without copying the provider-owned file",
+                                        other.unwrap_or("missing")
+                                    )));
+                                }
                             }
                         }
 
@@ -515,6 +638,29 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
     }
 
     Ok(input)
+}
+
+fn append_anthropic_document_content_as_responses_text(
+    content: Option<&Value>,
+    role: &str,
+    parts: &mut Vec<Value>,
+) {
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    match content {
+        Some(Value::String(text)) => parts.push(json!({ "type": content_type, "text": text })),
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    parts.push(json!({ "type": content_type, "text": text }));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// OpenAI Responses 响应 → Anthropic 响应
@@ -942,6 +1088,85 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_url_image_maps_to_responses_input_image() {
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": { "type": "url", "url": "https://example.com/cat.png" }
+                }]
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(
+            result["input"][0]["content"][0]["image_url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    #[test]
+    fn anthropic_document_maps_to_responses_file_and_text_input() {
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "title": "report.pdf", "source": {"type": "url", "url": "https://example.com/report.pdf"}},
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "plain text"}}
+                ]
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let content = &result["input"][0]["content"];
+        assert_eq!(content[0]["type"], "input_file");
+        assert_eq!(content[0]["file_url"], "https://example.com/report.pdf");
+        assert_eq!(content[0]["filename"], "report.pdf");
+        assert_eq!(content[1]["type"], "input_text");
+        assert_eq!(content[1]["text"], "plain text");
+    }
+
+    #[test]
+    fn anthropic_content_document_maps_to_responses_text_input() {
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "source": {"type": "content", "content": "embedded document text"}
+                }]
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            result["input"][0]["content"][0]["text"],
+            "embedded document text"
+        );
+    }
+
+    #[test]
+    fn anthropic_provider_file_is_not_silently_converted_to_responses_file() {
+        let input = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "source": { "type": "file", "file_id": "file_anthropic_only" }
+                }]
+            }]
+        });
+
+        let error = anthropic_to_responses(input, None, false, false)
+            .expect_err("provider-owned file IDs are not portable");
+        assert!(error
+            .to_string()
+            .contains("cannot represent Anthropic document source `file`"));
+    }
+
+    #[test]
     fn test_responses_to_anthropic_simple() {
         let input = json!({
             "id": "resp_123",
@@ -1155,6 +1380,89 @@ mod tests {
 
         let result = anthropic_to_responses(input, Some("my-provider-id"), false, false).unwrap();
         assert_eq!(result["prompt_cache_key"], "my-provider-id");
+    }
+
+    #[test]
+    fn anthropic_structured_output_maps_to_responses_text_format() {
+        let input = json!({
+            "model": "gpt-5",
+            "messages": [{ "role": "user", "content": "Extract a person." }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "tools": [{
+                "name": "lookup",
+                "strict": true,
+                "input_schema": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["text"]["format"]["type"], "json_schema");
+        assert_eq!(result["text"]["format"]["strict"], true);
+        assert_eq!(result["text"]["format"]["schema"]["required"][0], "name");
+        assert_eq!(result["tools"][0]["strict"], true);
+    }
+
+    #[test]
+    fn anthropic_non_strict_compatible_output_schema_does_not_force_responses_strict() {
+        let input = json!({
+            "messages": [{ "role": "user", "content": "Extract a person." }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } }
+                    }
+                }
+            }
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["text"]["format"]["strict"], false);
+    }
+
+    #[test]
+    fn applies_only_supported_prompt_cache_retention_values() {
+        let mut result = json!({});
+        apply_prompt_cache_retention(&mut result, Some("24h"));
+        assert_eq!(result["prompt_cache_retention"], "24h");
+
+        apply_prompt_cache_retention(&mut result, Some("invalid"));
+        assert_eq!(result["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn anthropic_metadata_user_id_maps_to_responses_safety_identifier() {
+        let input = json!({
+            "model": "gpt-5",
+            "metadata": { "user_id": "stable-user-123" },
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["safety_identifier"], "stable-user-123");
+    }
+
+    #[test]
+    fn codex_oauth_does_not_receive_safety_identifier() {
+        let input = json!({
+            "model": "gpt-5",
+            "metadata": { "user_id": "stable-user-123" },
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_responses(input, None, true, false).unwrap();
+        assert!(result.get("safety_identifier").is_none());
     }
 
     #[test]
@@ -1708,6 +2016,20 @@ mod tests {
         assert_eq!(result["input_tokens"], json!(20));
         assert_eq!(result["output_tokens"], json!(50));
         assert_eq!(result["cache_read_input_tokens"], json!(80));
+    }
+
+    #[test]
+    fn test_build_usage_maps_responses_reasoning_tokens() {
+        let result = build_anthropic_usage_from_responses(Some(&json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "output_tokens_details": { "reasoning_tokens": 17 }
+        })));
+
+        assert_eq!(
+            result["output_tokens_details"]["thinking_tokens"],
+            json!(17)
+        );
     }
 
     #[test]

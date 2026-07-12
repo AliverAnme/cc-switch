@@ -393,12 +393,25 @@ pub fn transform_claude_request_for_api_format(
             // Codex OAuth (ChatGPT Plus/Pro 反代) 需要在请求体里强制 store: false
             // + include: ["reasoning.encrypted_content"]，由 transform 层统一处理。
             let codex_fast_mode = provider.codex_fast_mode_enabled();
-            super::transform_responses::anthropic_to_responses(
+            let mut result = super::transform_responses::anthropic_to_responses(
                 body,
                 cache_key,
                 is_codex_oauth,
                 codex_fast_mode,
-            )
+            )?;
+            // `cache_control` cannot be forwarded to Responses.  Preserve the
+            // closest *explicitly requested* cache policy instead of silently
+            // turning Anthropic's TTL into a different OpenAI billing policy.
+            if !is_codex_oauth {
+                super::transform_responses::apply_prompt_cache_retention(
+                    &mut result,
+                    provider
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.prompt_cache_retention.as_deref()),
+                );
+            }
+            Ok(result)
         }
         "openai_chat" => {
             let preserve_reasoning_content =
@@ -1625,6 +1638,36 @@ mod tests {
         assert_eq!(transformed["model"], "gpt-5.4");
         assert!(transformed.get("input").is_some());
         assert!(transformed.get("max_output_tokens").is_some());
+    }
+
+    #[test]
+    fn test_transform_claude_request_for_responses_applies_explicit_cache_retention() {
+        let provider = create_provider_with_meta(
+            json!({
+                "env": { "ANTHROPIC_BASE_URL": "https://api.openai.example.com" }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                prompt_cache_retention: Some("24h".to_string()),
+                ..ProviderMeta::default()
+            },
+        );
+        let body = json!({
+            "model": "gpt-5.4",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        let transformed = transform_claude_request_for_api_format(
+            body,
+            &provider,
+            "openai_responses",
+            Some("session-123"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(transformed["prompt_cache_key"], "session-123");
+        assert_eq!(transformed["prompt_cache_retention"], "24h");
     }
 
     #[test]
