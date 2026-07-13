@@ -1653,12 +1653,26 @@ pub(crate) fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
         "total_tokens": total_tokens
     });
 
-    if let Some(cached) = usage
+    let cached = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
         .and_then(|v| v.as_u64())
-    {
-        result["input_tokens_details"] = json!({ "cached_tokens": cached });
+        .unwrap_or(0);
+    let cache_write = usage
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .unwrap_or(0);
+    if cached > 0 || cache_write > 0 {
+        result["input_tokens_details"] = json!({
+            "cached_tokens": cached,
+            "cache_write_tokens": cache_write
+        });
     }
 
     if let Some(details) = usage
@@ -1677,8 +1691,8 @@ pub(crate) fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     if let Some(cache_read) = usage.get("cache_read_input_tokens") {
         result["cache_read_input_tokens"] = cache_read.clone();
     }
-    if let Some(cache_creation) = usage.get("cache_creation_input_tokens") {
-        result["cache_creation_input_tokens"] = cache_creation.clone();
+    if cache_write > 0 {
+        result["cache_creation_input_tokens"] = json!(cache_write);
     }
 
     result
@@ -2788,7 +2802,7 @@ mod tests {
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15,
-                "prompt_tokens_details": {"cached_tokens": 3}
+                "prompt_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2}
             }
         });
 
@@ -2812,6 +2826,10 @@ mod tests {
         assert_eq!(result["usage"]["input_tokens"], 10);
         assert_eq!(result["usage"]["output_tokens"], 5);
         assert_eq!(result["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            result["usage"]["input_tokens_details"]["cache_write_tokens"],
+            2
+        );
     }
 
     #[test]

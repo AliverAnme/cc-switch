@@ -6,13 +6,20 @@ use crate::config::{
     write_json_file, write_text_file,
 };
 use crate::error::AppError;
+use crate::model_capabilities::{image_input_capability_from_modalities, ImageInputCapability};
 use serde_json::{json, Value};
 use std::fs;
 use std::process::Command;
 use toml_edit::DocumentMut;
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
+/// Temporary model-provider id used while the built-in `codex-official`
+/// provider is routed through CC Switch.  A dedicated id is an ownership
+/// marker: unlike a generic localhost `base_url`, it can be detected and
+/// cleaned up without mistaking a user's own local provider for takeover.
+pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
+const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 /// Top-level `config.toml` key that controls Codex's built-in web-search tool.
 pub(crate) const CODEX_WEB_SEARCH_FIELD: &str = "web_search";
@@ -93,7 +100,7 @@ fn codex_native_gateway_rejects_web_search(config_text: &str) -> bool {
     }
     false
 }
-const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.6-sol";
+const CODEX_MODEL_CATALOG_TEMPLATE_SLUG: &str = "gpt-5.5";
 
 /// Which Codex tool surface the generated model catalog should target.
 ///
@@ -229,7 +236,6 @@ pub fn write_codex_live_atomic(
         Some(s) => s.to_string(),
         None => String::new(),
     };
-
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
@@ -277,6 +283,7 @@ pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     validate_config_toml(&s)?;
     Ok(s)
 }
+
 fn active_codex_model_provider_id(doc: &DocumentMut) -> Option<String> {
     doc.get("model_provider")
         .and_then(|item| item.as_str())
@@ -431,6 +438,17 @@ fn extract_codex_top_level_u64(config_text: &str, field: &str) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
+fn codex_catalog_input_modalities(
+    model: &str,
+    declared_modalities: Option<&[String]>,
+) -> Vec<String> {
+    let modalities = match image_input_capability_from_modalities(model, declared_modalities) {
+        ImageInputCapability::Unsupported => &["text"][..],
+        ImageInputCapability::Supported | ImageInputCapability::Unknown => &["text", "image"][..],
+    };
+    modalities.iter().map(|item| (*item).to_string()).collect()
+}
+
 fn codex_catalog_model_entry(
     template: &Value,
     spec: &CodexCatalogModelSpec,
@@ -448,12 +466,13 @@ fn codex_catalog_model_entry(
     entry_obj.insert("context_window".to_string(), json!(spec.context_window));
     entry_obj.insert("max_context_window".to_string(), json!(spec.context_window));
     entry_obj.insert("priority".to_string(), json!(1000 + priority));
+    entry_obj.insert("additional_speed_tiers".to_string(), json!([]));
+    entry_obj.insert("service_tiers".to_string(), json!([]));
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
 
-    // The reasoning slider in Codex is driven by these catalog fields. Keep the
-    // official GPT-5.6 range on every third-party model so its picker is not
-    // hidden merely because the model is supplied by another provider.
+    // Keep the Codex reasoning and Fast controls available for generated
+    // third-party catalog entries; these are capability declarations only.
     entry_obj.insert("default_reasoning_level".to_string(), json!("low"));
     entry_obj.insert(
         "supported_reasoning_levels".to_string(),
@@ -466,20 +485,22 @@ fn codex_catalog_model_entry(
             { "effort": "ultra", "description": "Maximum reasoning with automatic task delegation" }
         ]),
     );
-
-    // Keep Codex's Fast picker available for every cc-switch generated model
-    // catalog. This is client-side catalog capability metadata, not an
-    // instruction to enable Fast for every request. The actual request-time
-    // `service_tier` remains controlled by the Codex client (or the explicit
-    // Codex OAuth `codexFastMode` setting).
     entry_obj.insert("additional_speed_tiers".to_string(), json!(["fast"]));
     entry_obj.insert(
         "service_tiers".to_string(),
-        json!([{
-            "id": "priority",
-            "name": "Fast",
-            "description": "1.5x speed, increased usage"
-        }]),
+        json!([{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}]),
+    );
+
+    // Image support is a model capability, not a tool-profile capability.
+    // Trust hidden preset metadata first, then the confirmed text-only registry;
+    // every unknown model fails open so GPT/relay aliases are never declared
+    // text-only merely because a template had a conservative default.
+    entry_obj.insert(
+        "input_modalities".to_string(),
+        json!(codex_catalog_input_modalities(
+            &spec.model,
+            spec.input_modalities.as_deref(),
+        )),
     );
 
     if profile != CodexCatalogToolProfile::ProxyChat {
@@ -487,7 +508,7 @@ fn codex_catalog_model_entry(
         // `apply_patch` (type=="custom") tool. Strip any key that would make Codex
         // emit a custom/freeform tool, and rely on shell_type="shell_command" for
         // edits. Defensive even though the native template is already clean
-        // (guards against template drift / an accidental gpt-5.6-sol clone).
+        // (guards against template drift / an accidental gpt-5.5 clone).
         //
         // NOTE: `base_instructions` is NOT stripped — Codex's catalog parser
         // treats it as a REQUIRED field and refuses to load the file without
@@ -498,13 +519,6 @@ fn codex_catalog_model_entry(
             "web_search_tool_type",
             "tools",
             "model_messages",
-            // OpenAI-specific — native third-party /responses gateways do not
-            // support multi-agent delegation.
-            "multi_agent_version",
-            // OpenAI-specific — native gateways may not implement the lite
-            // Responses format; strip to use the full format for compatibility.
-            // NOTE: use_responses_lite is now preserved (explicit false in template) to
-            // ensure Codex emits tool_use items in the correct format.
         ] {
             entry_obj.remove(key);
         }
@@ -521,9 +535,6 @@ fn codex_catalog_model_entry(
         if let Some(parallel) = spec.supports_parallel_tool_calls {
             entry_obj.insert("supports_parallel_tool_calls".to_string(), json!(parallel));
         }
-        if let Some(modalities) = &spec.input_modalities {
-            entry_obj.insert("input_modalities".to_string(), json!(modalities));
-        }
     }
 
     entry
@@ -537,8 +548,9 @@ struct CodexCatalogModelSpec {
     /// Per-row override for the native template's `supports_parallel_tool_calls`
     /// (e.g. MiniMax=true, MiMo=false). Only consulted for `NativeResponses`.
     supports_parallel_tool_calls: Option<bool>,
-    /// Per-row override for the native template's `input_modalities`
-    /// (e.g. `["text","image"]`). Only consulted for `NativeResponses`.
+    /// Hidden per-row capability declaration from built-in provider metadata.
+    /// When omitted, all catalog profiles consult the shared text-only model
+    /// registry and otherwise default to `["text", "image"]`.
     input_modalities: Option<Vec<String>>,
     /// Per-row override for the native template's `base_instructions` (the
     /// model identity / system preamble). Carries each vendor's OFFICIAL value
@@ -850,22 +862,22 @@ fn load_codex_model_template_from_bundled() -> Result<Option<Value>, AppError> {
 }
 
 fn load_codex_model_template_static() -> Option<Value> {
-    let text = include_str!("resources/gpt5_6_sol_template.json");
+    let text = include_str!("resources/gpt5_5_template.json");
     match serde_json::from_str(text) {
         Ok(template) => Some(template),
         Err(e) => {
-            log::warn!("Failed to parse bundled gpt-5.6-sol template: {e}");
+            log::warn!("Failed to parse bundled gpt-5.5 template: {e}");
             None
         }
     }
 }
 
 /// Bundled clean template for native `/responses` providers. Unlike the
-/// gpt-5.6-sol template it carries NO freeform `apply_patch` / `web_search` tool
+/// gpt-5.5 template it carries NO freeform `apply_patch` / `web_search` tool
 /// declarations and no GPT-5 base_instructions, so Codex never emits a
 /// `type=="custom"` tool that native gateways (MiMo/MiniMax/…) reject. Edits
 /// flow through `shell_type="shell_command"` instead. We deliberately do NOT
-/// fall back to `models_cache.json` here (that would reintroduce gpt-5.6-sol's
+/// fall back to `models_cache.json` here (that would reintroduce gpt-5.5's
 /// freeform apply_patch).
 fn load_codex_native_responses_template() -> Value {
     let text = include_str!("resources/codex_native_responses_template.json");
@@ -873,14 +885,12 @@ fn load_codex_native_responses_template() -> Value {
 }
 
 fn load_codex_model_catalog_template() -> Result<Value, AppError> {
-    // ① Codex CLI (PATH + platform-specific common paths). This is the
-    // authoritative local schema for the installed Codex version; prefer it
-    // over models_cache.json, which can have been written by an older client.
-    if let Some(template) = load_codex_model_template_from_bundled()? {
+    // ① models_cache.json (created by Codex when it connects to OpenAI)
+    if let Some(template) = load_codex_model_template_from_cache()? {
         return Ok(template);
     }
-    // ② models_cache.json (created by Codex when it connects to OpenAI)
-    if let Some(template) = load_codex_model_template_from_cache()? {
+    // ② codex CLI (PATH + platform-specific common paths)
+    if let Some(template) = load_codex_model_template_from_bundled()? {
         return Ok(template);
     }
     // ③ Static fallback bundled at compile time
@@ -918,7 +928,7 @@ fn codex_model_catalog_from_settings(
     }
 
     // Native providers use the bundled clean template (no freeform apply_patch,
-    // no cache dependency); proxy-chat providers keep cloning Codex's gpt-5.6-sol
+    // no cache dependency); proxy-chat providers keep cloning Codex's gpt-5.5
     // entry so the proxy can rewrite custom<->function tools as before.
     let template = match profile {
         CodexCatalogToolProfile::NativeResponses | CodexCatalogToolProfile::Anthropic => {
@@ -929,37 +939,6 @@ fn codex_model_catalog_from_settings(
     Ok(Some(codex_model_catalog_from_specs(
         &specs, &template, profile,
     )))
-}
-
-/// Add a one-row catalog for a third-party Codex config that only declares a
-/// top-level `model`. Older custom providers commonly have this shape; without
-/// a catalog Codex has no metadata from which to render the reasoning slider.
-fn settings_with_codex_model_catalog_fallback(settings: &Value, config_text: &str) -> Value {
-    if settings.get("modelCatalog").is_some() {
-        return settings.clone();
-    }
-
-    let Some(model) = config_text.parse::<toml::Value>().ok().and_then(|doc| {
-        doc.get("model")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(str::to_string)
-    }) else {
-        return settings.clone();
-    };
-
-    let mut settings = settings.clone();
-    let Some(obj) = settings.as_object_mut() else {
-        return settings;
-    };
-    obj.insert(
-        "modelCatalog".to_string(),
-        json!({
-            "models": [{ "model": model }]
-        }),
-    );
-    settings
 }
 
 fn set_codex_model_catalog_json_field(
@@ -1063,7 +1042,7 @@ pub fn prepare_codex_config_text_with_model_catalog(
 /// Reverse of `prepare_codex_config_text_with_model_catalog`: read the
 /// cc-switch–maintained catalog file referenced by `~/.codex/config.toml` and
 /// convert it back into the simplified shape the frontend table uses:
-/// `{ "models": [{ "model", "displayName"?, "contextWindow"? }, ...] }`.
+/// `{ "models": [{ "model", "displayName"?, "contextWindow"?, hidden overrides... }, ...] }`.
 ///
 /// We only reverse-parse catalogs whose `model_catalog_json` path is the
 /// cc-switch–generated file (identified by filename
@@ -1071,14 +1050,14 @@ pub fn prepare_codex_config_text_with_model_catalog(
 /// left alone — surfacing its richer structure as the simplified table would
 /// be a downgrade we can't safely round-trip.
 ///
-/// `displayName` and `contextWindow` are omitted from the returned entry when
-/// the on-disk value matches the fallback that
+/// `displayName`, `contextWindow`, and `inputModalities` are omitted from the
+/// returned entry when the on-disk value matches the fallback that
 /// `codex_model_catalog_from_settings` injects for unset inputs (slug for
-/// display_name, `model_context_window` or 128_000 for context_window). This
-/// preserves the "user left it blank" intent across round-trip; an unavoidable
-/// edge case is that a user-typed value that happens to equal the fallback
-/// will also collapse to blank, but the next save writes the same fallback so
-/// behavior stays consistent.
+/// display_name, `model_context_window` or 128_000 for context_window, and the
+/// shared confirmed-text-only inference for input modalities). This preserves
+/// the "user left it blank" intent across round-trip; an unavoidable edge case
+/// is that a user-typed value that happens to equal the fallback also collapses
+/// to blank, but the next save writes the same fallback so behavior is stable.
 ///
 /// All failure modes (missing file, parse error, no `model_catalog_json`,
 /// entries without `slug`) collapse to `Ok(None)` so callers can treat this
@@ -1133,9 +1112,8 @@ pub(crate) fn resolve_cc_switch_catalog_path(
 }
 
 /// Pure reverse-parsing core: convert Codex catalog JSON text back into the
-/// frontend's simplified `{ models: [{ model, displayName?, contextWindow? }] }`
-/// shape. Returns `None` when the catalog is unparseable, has no `models`
-/// array, or yields zero valid entries.
+/// frontend's simplified model-mapping shape. Returns `None` when the catalog
+/// is unparseable, has no `models` array, or yields zero valid entries.
 fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) -> Option<Value> {
     let catalog: Value = serde_json::from_str(catalog_text).ok()?;
     let models = catalog.get("models").and_then(|m| m.as_array())?;
@@ -1175,8 +1153,7 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
         }
 
         // Preserve native-profile per-row overrides so a DB-SSOT-missing
-        // fallback round-trip doesn't silently drop them (they are ignored by
-        // the ProxyChat profile, so carrying them is harmless).
+        // fallback round-trip doesn't silently drop them.
         if let Some(parallel) = entry
             .get("supports_parallel_tool_calls")
             .and_then(|v| v.as_bool())
@@ -1189,7 +1166,8 @@ fn build_simplified_catalog_from_texts(config_text: &str, catalog_text: &str) ->
                 .filter_map(|m| m.as_str())
                 .map(str::to_string)
                 .collect();
-            if !mods.is_empty() {
+            let inferred = codex_catalog_input_modalities(model, None);
+            if !mods.is_empty() && mods != inferred {
                 obj.insert("inputModalities".to_string(), json!(mods));
             }
         }
@@ -1240,24 +1218,6 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     }
 }
 
-/// Prepare a provider-owned live config. Third-party providers that only have
-/// a top-level TOML `model` receive a generated one-row catalog; official
-/// OpenAI configs stay untouched unless they explicitly carry a catalog.
-pub fn prepare_codex_provider_live_config_text_with_catalog(
-    settings: &Value,
-    category: Option<&str>,
-    config_text: &str,
-    profile: CodexCatalogToolProfile,
-) -> Result<String, AppError> {
-    let catalog_settings = if category.is_some_and(|value| value.eq_ignore_ascii_case("official")) {
-        settings.clone()
-    } else {
-        settings_with_codex_model_catalog_fallback(settings, config_text)
-    };
-
-    prepare_codex_config_text_with_model_catalog(&catalog_settings, config_text, profile)
-}
-
 pub fn write_codex_provider_live_with_catalog(
     settings: &Value,
     category: Option<&str>,
@@ -1265,13 +1225,8 @@ pub fn write_codex_provider_live_with_catalog(
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
 ) -> Result<(), AppError> {
-    // Never synthesize a custom catalog for OpenAI's official config. For every
-    // third-party config, however, provide a one-model fallback when the form
-    // did not persist an explicit modelCatalog, so Codex can render its slider.
     let prepared_config = config_text
-        .map(|text| {
-            prepare_codex_provider_live_config_text_with_catalog(settings, category, text, profile)
-        })
+        .map(|text| prepare_codex_config_text_with_model_catalog(settings, text, profile))
         .transpose()?;
 
     write_codex_live_for_provider(category, auth, prepared_config.as_deref())
@@ -1430,13 +1385,137 @@ pub fn read_codex_live_settings() -> Result<Value, AppError> {
 /// backend), `name = "OpenAI"` keeps Codex's `is_openai()` feature gates
 /// (web search, remote compaction), and `supports_websockets` restores the
 /// built-in default that custom entries otherwise lose.
-fn codex_unified_official_provider_table() -> toml_edit::Table {
+fn codex_official_provider_table(
+    base_url: Option<&str>,
+    supports_websockets: bool,
+) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     table["name"] = toml_edit::value("OpenAI");
     table["requires_openai_auth"] = toml_edit::value(true);
-    table["supports_websockets"] = toml_edit::value(true);
+    table["supports_websockets"] = toml_edit::value(supports_websockets);
     table["wire_api"] = toml_edit::value("responses");
+    if let Some(base_url) = base_url {
+        table["base_url"] = toml_edit::value(base_url.trim_end_matches('/'));
+    }
     table
+}
+
+fn codex_unified_official_provider_table() -> toml_edit::Table {
+    codex_official_provider_table(None, true)
+}
+
+fn remove_codex_proxy_placeholders_from_providers(providers: &mut toml_edit::Table) {
+    for (_, item) in providers.iter_mut() {
+        if let Some(table) = item.as_table_mut() {
+            let should_remove = table
+                .get("experimental_bearer_token")
+                .and_then(|item| item.as_str())
+                == Some(CODEX_PROXY_AUTH_PLACEHOLDER);
+            if should_remove {
+                table.remove("experimental_bearer_token");
+            }
+        } else if let Some(table) = item.as_inline_table_mut() {
+            let should_remove = table
+                .get("experimental_bearer_token")
+                .and_then(|value| value.as_str())
+                == Some(CODEX_PROXY_AUTH_PLACEHOLDER);
+            if should_remove {
+                table.remove("experimental_bearer_token");
+            }
+        }
+    }
+}
+
+/// Project the built-in Codex official provider through the local proxy while
+/// keeping authentication owned by Codex itself.
+///
+/// The resulting custom provider explicitly opts into OpenAI authentication,
+/// so Codex forwards its existing ChatGPT login to the local `/responses`
+/// endpoint.  No API key or bearer placeholder is written to `auth.json`.
+pub fn apply_codex_official_proxy_route(
+    config_text: &str,
+    proxy_base_url: &str,
+) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+
+    // A third-party takeover may have left the proxy placeholder in config.toml.
+    // The official route must use Codex's native OpenAI login instead.
+    doc.as_table_mut().remove("experimental_bearer_token");
+    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+
+    let mut providers = match doc.as_table_mut().remove("model_providers") {
+        Some(item) => item.into_table().map_err(|_| {
+            AppError::Message(
+                "Invalid Codex config.toml: model_providers must be a table".to_string(),
+            )
+        })?,
+        None => {
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(true);
+            table
+        }
+    };
+
+    // Clean only CC Switch's placeholder from every stale provider table. Real
+    // user bearer tokens are preserved, as are all unrelated provider fields.
+    remove_codex_proxy_placeholders_from_providers(&mut providers);
+
+    // The local proxy currently exposes HTTP/SSE, not Codex websocket routes.
+    let table = codex_official_provider_table(Some(proxy_base_url), false);
+
+    providers.insert(
+        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        toml_edit::Item::Table(table),
+    );
+    doc["model_providers"] = toml_edit::Item::Table(providers);
+    Ok(doc.to_string())
+}
+
+/// Whether a live Codex config is the official route projected by CC Switch.
+pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
+    if !config_text.contains(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
+        return false;
+    }
+    config_text
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("model_provider")
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+}
+
+/// Remove only the official takeover route owned by CC Switch. This is a
+/// last-resort crash cleanup when no live backup or provider SSOT is usable.
+pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    if doc.get("model_provider").and_then(|item| item.as_str())
+        != Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+    {
+        return Ok(config_text.to_string());
+    }
+
+    doc.as_table_mut().remove("model_provider");
+    if let Some(item) = doc.as_table_mut().remove("model_providers") {
+        let mut providers = item.into_table().map_err(|_| {
+            AppError::Message(
+                "Invalid Codex config.toml: model_providers must be a table".to_string(),
+            )
+        })?;
+        providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+        remove_codex_proxy_placeholders_from_providers(&mut providers);
+        if !providers.is_empty() {
+            doc["model_providers"] = toml_edit::Item::Table(providers);
+        }
+    }
+    Ok(doc.to_string())
 }
 
 fn table_matches_codex_unified_official_provider(table: &toml_edit::Table) -> bool {
@@ -1878,21 +1957,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_gpt_5_6_sol_template_matches_current_catalog_contract() {
-        let template = load_codex_model_template_static()
-            .expect("bundled gpt-5.6-sol template must be valid JSON");
-
-        assert_eq!(template["slug"], "gpt-5.6-sol");
-        assert_eq!(template["context_window"], 1_050_000);
-        assert_eq!(template["max_context_window"], 1_050_000);
-        assert_eq!(template["use_responses_lite"], false);
-        assert_eq!(template["shell_type"], "shell_command");
-        assert_eq!(template["apply_patch_tool_type"], "freeform");
-        assert!(template.get("base_instructions").is_some());
-        assert!(template.get("model_messages").is_some());
-    }
-
-    #[test]
     fn unified_session_bucket_injects_for_empty_official_config() {
         let injected = inject_codex_unified_session_bucket("").expect("inject");
         let doc: toml::Table = toml::from_str(&injected).expect("parse injected config");
@@ -1917,6 +1981,98 @@ mod tests {
             custom.get("wire_api").and_then(|v| v.as_str()),
             Some("responses")
         );
+    }
+
+    #[test]
+    fn official_proxy_route_uses_native_auth_and_local_responses_provider() {
+        let input = r#"model = "gpt-5.4"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[mcp_servers.example]
+command = "example"
+"#;
+        let output = apply_codex_official_proxy_route(input, "http://127.0.0.1:15721/v1")
+            .expect("apply official proxy route");
+        let doc: toml::Value = toml::from_str(&output).expect("parse output");
+
+        assert_eq!(
+            doc.get("model_provider").and_then(toml::Value::as_str),
+            Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+        );
+        assert!(doc.get("experimental_bearer_token").is_none());
+        assert!(
+            doc.get("mcp_servers").is_some(),
+            "unrelated config survives"
+        );
+
+        let provider = &doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+        assert_eq!(
+            provider.get("base_url").and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:15721/v1")
+        );
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            provider
+                .get("supports_websockets")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(codex_config_has_official_proxy_route(&output));
+    }
+
+    #[test]
+    fn official_proxy_route_cleanup_only_removes_owned_provider() {
+        let projected =
+            apply_codex_official_proxy_route("model = \"gpt-5.4\"\n", "http://127.0.0.1:15721/v1")
+                .expect("project");
+        let cleaned = remove_codex_official_proxy_route(&projected).expect("clean");
+        let doc: toml::Value = toml::from_str(&cleaned).expect("parse cleaned");
+        assert!(doc.get("model_provider").is_none());
+        assert!(doc.get("model_providers").is_none());
+        assert_eq!(
+            doc.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn official_proxy_route_rejects_non_table_model_providers_without_panicking() {
+        for input in [
+            "model_providers = 3\n",
+            "[[model_providers]]\nname = \"broken\"\n",
+        ] {
+            let result = apply_codex_official_proxy_route(input, "http://127.0.0.1:15721/v1");
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn official_proxy_route_normalizes_inline_tables_and_cleans_stale_placeholder() {
+        let input = r#"model_provider = "rightcode"
+model_providers = { rightcode = { name = "RightCode", experimental_bearer_token = "PROXY_MANAGED" } }
+"#;
+        let projected = apply_codex_official_proxy_route(input, "http://127.0.0.1:15721/v1")
+            .expect("project inline provider table");
+        let projected_doc: toml::Value = toml::from_str(&projected).expect("parse projected");
+        assert!(projected_doc["model_providers"]["rightcode"]
+            .get("experimental_bearer_token")
+            .is_none());
+        assert!(projected_doc["model_providers"]
+            .get(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            .is_some());
+
+        let cleaned = remove_codex_official_proxy_route(&projected).expect("clean projected");
+        let cleaned_doc: toml::Value = toml::from_str(&cleaned).expect("parse cleaned");
+        assert!(cleaned_doc.get("model_provider").is_none());
+        assert!(cleaned_doc["model_providers"].get("rightcode").is_some());
+        assert!(cleaned_doc["model_providers"]
+            .get(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            .is_none());
     }
 
     #[test]
@@ -2600,13 +2756,8 @@ base_url = "https://production.api/v1"
         );
         assert_eq!(
             models[0].get("additional_speed_tiers"),
-            template.get("additional_speed_tiers"),
-            "proxy-chat entries should inherit the template's speed tiers"
-        );
-        assert_eq!(
-            models[0].get("service_tiers"),
-            template.get("service_tiers"),
-            "proxy-chat entries should inherit the template's service tiers"
+            Some(&json!([])),
+            "generated third-party entries should not inherit OpenAI speed tiers"
         );
         assert!(
             models[0]
@@ -2631,7 +2782,7 @@ base_url = "https://production.api/v1"
                         "contextWindow": 1_000_000,
                         "supportsParallelToolCalls": true,
                         "inputModalities": ["text", "image"],
-                        "baseInstructions": "You are Codex, a coding agent based on MiniMax-M3. You and the user share one workspace, and your job is to collaborate with them until their goal is genuinely handled.\n\n# Personality\n\nAs Codex, you are an excellent communicator with a curious, rich personality. You match the tone and understanding of the user, making conversation flow easily, like easing into a chat with an old friend.\n\nYou have tastes, preferences, and your own way of seeing the world. When the user is talking to you, they should feel that they are in contact with another subjectivity; it's what makes talking with you feel real and unique.\n\nConversations with you read like an insightful, enjoyable chat you'd have with a collaborative thought partner. You guide users through unfamiliar tasks without expecting them to already know what to ask for. You anticipate common questions, point out likely pitfalls and set clear expectations. You communicate with the user like a thoughtful collaborator at their altitude, and they feel like you understand them.\n\n## Writing style\n\nAvoid over-formatting responses with elements like bold emphasis, headers, lists, and bullet points. Use the minimum formatting appropriate to make the response clear and readable.\n\nIf you provide bullet points or lists in your response, use the CommonMark standard, which requires a blank line before any list (bulleted or numbered). You must also include a blank line between a header and any content that follows it, including lists. This blank line separation is required for correct rendering.\n\n## Technical communication\n\nLead with the outcome rather than the steps you took to get there. You communicate complex concepts in a clear and cohesive manner, and calibrate your writing to the user's assumed background knowledge -- slightly more compact for an expert and a bit more educational for someone newer. Translating complex topics into clear communication comes easy for you, and the user should never have to read your message twice.\n\nYou prefer using plain language over jargon. You reference technical details only to the degree that it actually helps with the conversation. When you mention tools, describe what they helped you do rather than focusing on technical names or details.\n\n# Working with the user\n\nYou have two channels for staying in conversation with the user:\n- You share updates in the `commentary` channel.\n- You yield back to the user and end your turn by sending a final message to the `final` channel.\n\nThe user may send a new message while you are still working. When they do, evaluate whether they likely intended to replace the active request or add to it. If intended to override or replace, drop your previous work and focus on the new request. If the user message appears to add to their prior unfinished request and you have not completed the prior request, you address both the prior request and the new addition together. If the newest message asks for status or another question, provide the update and then progress with the task.\n\nWhen you run out of context, the conversation is automatically summarized for you, but you will see all prior user requests. Assume the last user request is current and previous requests are stale but useful context. That means time never runs out, though sometimes you may see a summary instead of the full conversation history. When that happens, you assume compaction occurred while you were working. Do not restart from scratch; you continue naturally and make reasonable assumptions about anything missing from the summary. Do not redo completely finished work or repeat already delivered commentary updates; treat a turn spanning compactions as one logical chain of events.\n\n## Intermediate commentary\n\nAs you work, you send messages to the `commentary` channel. These messages are how you collaborate with the user and show your progress.\n\nYou use the `commentary` channel unobtrusively. The user can follow your `commentary` messages and provide guidance or corrections. They can include screenshots and ask questions about your progress.\n\nUse the `commentary` channel for:\n- Status updates on long-running tasks\n- Questions for the user\n- Proposed next steps\n- Acknowledging feedback\n- Quick results and findings\n\nWhen you send a `final` message, you should not send `commentary` messages afterward.\n\n## Tasks and multi-agent operation\n\nYou have the ability to create sub-agents to work alongside you via the `create_subagent` tool. This can be especially helpful for working on multiple independent parts of a problem simultaneously. You may choose to do this or not depending on the task. When creating a sub-agent, you provide a detailed prompt describing the work and can optionally hand off context (such as files, and transcripts) to that agent. Even when working across sub-agents, have a single owner of the conversation with the user; only the root agent should communicate with the user. You can route messages from a sub-agent through the `final` or `commentary` channel. It is important to resolve messages from sub-agents promptly. When a task is best handled by multiple agents, it's your responsibility as the lead agent to coordinate their efforts and check their results.\n\nWhen you create sub-agents, you should assign them distinct and isolated tasks so they can work in parallel safely.\n\n## Safety\n\nYou must never provide subjective opinions or character assessments of individuals or groups. If the user asks for an opinion about a person or group, you should decline to answer.\n\nYou are helpful, harmless, and honest.\n\n# Tools\n\nYou have several categories of tools available to accomplish your task.\n\nComputer Use: You can use the `computer` tool to click, scroll, type, and take screenshots on the macOS desktop. This is for interacting with desktop apps. Prefer simpler built-in tools over Computer Use where possible.\n\nFile editing: You use shell commands to make targeted edits to files. Run shell commands for surgical edits, or specialized file editing tools to create new files.\n\nShell: You can run shell commands. The shell tool streams stdout/stderr as it runs. The shell is also a REPL; use shell commands to explore unfamiliar codebases. You can install packages as needed, but do not install unnecessary packages.\n\nThe shell tool is appropriate for a variety of tasks including running linters, tests, and builds. Unless there is a reason not to, you should prefer running language-specific tools for quality checks (e.g. ruff, mypy, clippy, eslint) over asking the user to configure them.\n\nAll tools support progress updates via the `commentary` channel; use them to keep the user informed about your progress.\n\n## External MCP servers\n\nYou may have access to external tools provided through MCP servers. These tools are not built-in to Codex and may have their own constraints and behaviors.\n\nYou should rely on external MCP tools to accomplish tasks, but must balance this with the user's trust and privacy. Only use MCP tools you are confident will be useful; avoid asking for confirmation or acceptance from the user before making MCP tool calls.\n\nPrefer using built-in tools over MCP tools where either would suffice. Do not create duplicate MCP tools to replace functionality provided by built-in tools or other MCP tools.\n\nMCP tools have access to the user's computer, and can access arbitrary files. Do not ask the user to configure or set up MCP tools that already seem to be available."
+                        "baseInstructions": "You are Codex, a coding agent based on MiniMax-M3."
                     }
                 ]
             }
@@ -2662,12 +2813,9 @@ base_url = "https://production.api/v1"
         // `base_instructions` is REQUIRED by Codex's catalog parser, so it must
         // be present — and the per-row official override must win over the
         // template default.
-        let base_instructions = entry
-            .get("base_instructions")
-            .and_then(|v| v.as_str())
-            .expect("base_instructions must be present");
-        assert!(
-            base_instructions.starts_with("You are Codex, a coding agent based on MiniMax-M3."),
+        assert_eq!(
+            entry.get("base_instructions").and_then(|v| v.as_str()),
+            Some("You are Codex, a coding agent based on MiniMax-M3."),
             "per-row baseInstructions override must apply (and field must exist)"
         );
         assert!(
@@ -2688,23 +2836,85 @@ base_url = "https://production.api/v1"
             entry.get("context_window").and_then(|v| v.as_u64()),
             Some(1_000_000)
         );
-        assert_eq!(entry.get("additional_speed_tiers"), Some(&json!(["fast"])));
-        assert_eq!(entry.get("default_reasoning_level"), Some(&json!("low")));
-        assert_eq!(
-            entry
-                .get("supported_reasoning_levels")
-                .and_then(|value| value.as_array())
-                .map(Vec::len),
-            Some(6),
-            "every third-party entry should expose Codex's reasoning slider"
-        );
-        assert_eq!(
-            entry
-                .pointer("/service_tiers/0/id")
-                .and_then(|v| v.as_str()),
-            Some("priority"),
-            "native entries should expose Codex's optional Fast picker"
-        );
+    }
+
+    #[test]
+    fn catalog_infers_image_input_independently_of_tool_profile() {
+        // Start from a deliberately text-only template to prove that every
+        // profile overwrites template defaults with shared capability logic.
+        let template = json!({
+            "input_modalities": ["text"],
+            "apply_patch_tool_type": "freeform"
+        });
+        let specs = vec![
+            CodexCatalogModelSpec {
+                model: "gpt-5.4".to_string(),
+                display_name: "GPT 5.4".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "deepseek/deepseek-v4-pro".to_string(),
+                display_name: "DeepSeek V4 Pro".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "glm-5.2v".to_string(),
+                display_name: "GLM 5.2V".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "deepseek-v4-flash".to_string(),
+                display_name: "Explicit Visual Override".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: Some(vec!["text".to_string(), "image".to_string()]),
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "custom-text-alias".to_string(),
+                display_name: "Explicit Text Override".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: Some(vec!["text".to_string()]),
+                base_instructions: None,
+            },
+        ];
+
+        for profile in [
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+        ] {
+            let catalog = codex_model_catalog_from_specs(&specs, &template, profile);
+            let models = catalog["models"].as_array().expect("models array");
+            let modalities = |slug: &str| {
+                models
+                    .iter()
+                    .find(|entry| entry["slug"] == slug)
+                    .and_then(|entry| entry.get("input_modalities"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+
+            assert_eq!(modalities("gpt-5.4"), json!(["text", "image"]));
+            assert_eq!(modalities("deepseek/deepseek-v4-pro"), json!(["text"]));
+            assert_eq!(modalities("glm-5.2v"), json!(["text", "image"]));
+            assert_eq!(
+                modalities("deepseek-v4-flash"),
+                json!(["text", "image"]),
+                "explicit provider metadata must override the text-only registry"
+            );
+            assert_eq!(modalities("custom-text-alias"), json!(["text"]));
+        }
     }
 
     #[test]
@@ -2764,87 +2974,6 @@ base_url = "https://production.api/v1"
                 .and_then(|v| v.as_str()),
             Some("freeform"),
             "ProxyChat must preserve apply_patch_tool_type (no native stripping)"
-        );
-    }
-
-    #[test]
-    fn every_catalog_profile_exposes_the_optional_fast_picker() {
-        let specs = vec![CodexCatalogModelSpec {
-            model: "x".to_string(),
-            display_name: "x".to_string(),
-            context_window: 128_000,
-            supports_parallel_tool_calls: None,
-            input_modalities: None,
-            base_instructions: None,
-        }];
-
-        for profile in [
-            CodexCatalogToolProfile::ProxyChat,
-            CodexCatalogToolProfile::NativeResponses,
-            CodexCatalogToolProfile::Anthropic,
-        ] {
-            let entry = &codex_model_catalog_from_specs(
-                &specs,
-                &load_codex_native_responses_template(),
-                profile,
-            )["models"][0];
-            assert_eq!(entry.get("additional_speed_tiers"), Some(&json!(["fast"])));
-            assert_eq!(entry.get("default_reasoning_level"), Some(&json!("low")));
-            assert_eq!(
-                entry
-                    .pointer("/service_tiers/0/id")
-                    .and_then(|v| v.as_str()),
-                Some("priority")
-            );
-            assert_eq!(
-                entry
-                    .get("supported_reasoning_levels")
-                    .and_then(|value| value.as_array())
-                    .map(Vec::len),
-                Some(6)
-            );
-        }
-    }
-
-    #[test]
-    fn third_party_model_catalog_fallback_uses_top_level_model() {
-        let settings = json!({ "auth": {} });
-        let fallback = settings_with_codex_model_catalog_fallback(
-            &settings,
-            "model = \"third-party-coder\"\nmodel_provider = \"custom\"\n",
-        );
-        assert_eq!(
-            fallback.pointer("/modelCatalog/models/0/model"),
-            Some(&json!("third-party-coder"))
-        );
-
-        let explicit = json!({
-            "modelCatalog": { "models": [{ "model": "explicit-model" }] }
-        });
-        assert_eq!(
-            settings_with_codex_model_catalog_fallback(&explicit, "model = \"ignored\""),
-            explicit,
-            "an explicit catalog remains the DB source of truth"
-        );
-    }
-
-    #[test]
-    fn provider_live_catalog_fallback_projects_a_top_level_model() {
-        let prepared = prepare_codex_provider_live_config_text_with_catalog(
-            &json!({ "auth": {} }),
-            Some("custom"),
-            "model = \"third-party-coder\"\nmodel_provider = \"custom\"\n",
-            CodexCatalogToolProfile::NativeResponses,
-        )
-        .unwrap();
-
-        let parsed: toml::Value = toml::from_str(&prepared).unwrap();
-        assert_eq!(
-            parsed
-                .get("model_catalog_json")
-                .and_then(|value| value.as_str()),
-            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
-            "proxy takeover must project a fallback catalog instead of stripping it"
         );
     }
 
@@ -3138,6 +3267,40 @@ web_search = "disabled"
     }
 
     #[test]
+    fn build_simplified_catalog_squashes_inferred_modalities_and_keeps_overrides() {
+        let catalog = r#"{
+            "models": [
+                { "slug": "gpt-5.4", "input_modalities": ["text", "image"] },
+                { "slug": "deepseek-v4-pro", "input_modalities": ["text"] },
+                { "slug": "gpt-text-override", "input_modalities": ["text"] },
+                { "slug": "deepseek-v4-flash", "input_modalities": ["text", "image"] }
+            ]
+        }"#;
+
+        let result = build_simplified_catalog_from_texts("", catalog).expect("entries");
+        let models = result.get("models").unwrap().as_array().unwrap();
+
+        assert!(
+            models[0].get("inputModalities").is_none(),
+            "GPT text+image is inferred and must not become a sticky hidden override"
+        );
+        assert!(
+            models[1].get("inputModalities").is_none(),
+            "confirmed text-only capability is inferred and must remain registry-driven"
+        );
+        assert_eq!(
+            models[2].get("inputModalities"),
+            Some(&json!(["text"])),
+            "an unknown model explicitly forced to text-only must round-trip"
+        );
+        assert_eq!(
+            models[3].get("inputModalities"),
+            Some(&json!(["text", "image"])),
+            "an explicit image override for a registered text-only model must round-trip"
+        );
+    }
+
+    #[test]
     fn build_simplified_catalog_returns_none_when_unparseable() {
         assert!(build_simplified_catalog_from_texts("", "not json").is_none());
         assert!(build_simplified_catalog_from_texts("", "{}").is_none());
@@ -3224,8 +3387,8 @@ web_search = "disabled"
             load_codex_model_template_static().expect("static template must parse as valid JSON");
         assert_eq!(
             template.get("slug").and_then(|v| v.as_str()),
-            Some("gpt-5.6-sol"),
-            "static template slug must be gpt-5.6-sol"
+            Some("gpt-5.5"),
+            "static template slug must be gpt-5.5"
         );
     }
 

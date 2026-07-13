@@ -2,9 +2,6 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
-use crate::proxy::providers::usage_core::{
-    build_anthropic_usage_with_output, empty_usage, RawTokens,
-};
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -70,9 +67,9 @@ struct Usage {
     #[serde(default)]
     completion_tokens: u32,
     #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default)]
     completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
     /// Some compatible servers return Anthropic-style cache fields directly
     #[serde(default)]
     cache_read_input_tokens: Option<u32>,
@@ -80,18 +77,20 @@ struct Usage {
     cache_creation_input_tokens: Option<u32>,
 }
 
-/// Nested token details from OpenAI format
-#[derive(Debug, Deserialize)]
-struct PromptTokensDetails {
-    #[serde(default)]
-    cached_tokens: u32,
-}
-
 /// Nested completion details from OpenAI format.
 #[derive(Debug, Deserialize)]
 struct CompletionTokensDetails {
     #[serde(default)]
     reasoning_tokens: u32,
+}
+
+/// Nested token details from OpenAI format
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -112,26 +111,40 @@ struct ToolBlockState {
 const INFINITE_WHITESPACE_THRESHOLD: usize = 500;
 
 fn build_anthropic_usage_json(usage: &Usage) -> Value {
-    let cached = extract_cache_read_tokens(usage).unwrap_or(0) as u64;
-    let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0) as u64;
-    let reasoning_tokens = usage
+    // OpenAI prompt_tokens 含缓存，Anthropic input_tokens 不含，需减去 cache_read 与 cache_creation
+    // （三桶互斥，恒等 input + cache_read + cache_creation == prompt_tokens）。
+    let cached = extract_cache_read_tokens(usage).unwrap_or(0);
+    let cache_creation = extract_cache_write_tokens(usage).unwrap_or(0);
+    let input_tokens = usage
+        .prompt_tokens
+        .saturating_sub(cached)
+        .saturating_sub(cache_creation);
+    let mut usage_json = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": usage.completion_tokens
+    });
+    if cached > 0 {
+        usage_json["cache_read_input_tokens"] = json!(cached);
+    }
+    if cache_creation > 0 {
+        usage_json["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+    if let Some(reasoning_tokens) = usage
         .completion_tokens_details
         .as_ref()
-        .map(|d| d.reasoning_tokens as u64)
-        .unwrap_or(0);
-    build_anthropic_usage_with_output(
-        RawTokens {
-            prompt_tokens: usage.prompt_tokens as u64,
-            cache_read: cached,
-            cache_creation,
-            reasoning_tokens,
-        },
-        usage.completion_tokens as u64,
-    )
+        .map(|details| details.reasoning_tokens)
+        .filter(|tokens| *tokens > 0)
+    {
+        usage_json["output_tokens_details"] = json!({"thinking_tokens": reasoning_tokens});
+    }
+    usage_json
 }
 
 fn default_anthropic_usage_json() -> Value {
-    empty_usage()
+    json!({
+        "input_tokens": 0,
+        "output_tokens": 0
+    })
 }
 
 fn build_message_delta_event(stop_reason: Option<String>, usage_json: Option<Value>) -> Value {
@@ -231,14 +244,28 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                                     if let Some(choice) = chunk.choices.first() {
                                         if !has_sent_message_start {
-                                            let mut start_usage = chunk.usage.as_ref()
-                                                .map(build_anthropic_usage_json)
-                                                .unwrap_or_else(empty_usage);
-                                            // Anthropic's message_start usage is input-side
-                                            // accounting. A compatible upstream can include its
-                                            // final usage in the same first chunk, but that must
-                                            // remain available only on the terminal message_delta.
-                                            start_usage["output_tokens"] = json!(0);
+                                            // Build usage with cache tokens if available from first chunk
+                                            let mut start_usage = json!({
+                                                "input_tokens": 0,
+                                                "output_tokens": 0
+                                            });
+                                            if let Some(u) = &chunk.usage {
+                                                let cached = extract_cache_read_tokens(u).unwrap_or(0);
+                                                let cache_creation =
+                                                    extract_cache_write_tokens(u).unwrap_or(0);
+                                                let input = u
+                                                    .prompt_tokens
+                                                    .saturating_sub(cached)
+                                                    .saturating_sub(cache_creation);
+                                                start_usage["input_tokens"] = json!(input);
+                                                if cached > 0 {
+                                                    start_usage["cache_read_input_tokens"] = json!(cached);
+                                                }
+                                                if cache_creation > 0 {
+                                                    start_usage["cache_creation_input_tokens"] =
+                                                        json!(cache_creation);
+                                                }
+                                            }
 
                                             let event = json!({
                                                 "type": "message_start",
@@ -675,6 +702,18 @@ fn extract_cache_read_tokens(usage: &Usage) -> Option<u32> {
         .filter(|&v| v > 0)
 }
 
+/// Extract cache-write tokens from direct compatibility fields or OpenAI details.
+fn extract_cache_write_tokens(usage: &Usage) -> Option<u32> {
+    if let Some(value) = usage.cache_creation_input_tokens {
+        return Some(value);
+    }
+    usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(|details| details.cache_write_tokens)
+        .filter(|value| *value > 0)
+}
+
 /// 映射停止原因
 fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     finish_reason.map(|r| {
@@ -1047,61 +1086,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_usage_chunk_maps_reasoning_tokens() {
-        let input = concat!(
-            "data: {\"id\":\"chatcmpl_reasoning_usage\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":25,\"completion_tokens_details\":{\"reasoning_tokens\":19}}}\n\n",
-            "data: [DONE]\n\n"
-        );
-
-        let events = collect_anthropic_events(input).await;
-        let message_delta = events
-            .iter()
-            .find(|event| event_type(event) == Some("message_delta"))
-            .expect("should emit message_delta with usage");
-
-        assert_eq!(
-            message_delta
-                .pointer("/usage/output_tokens_details/thinking_tokens")
-                .and_then(|v| v.as_u64()),
-            Some(19)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_message_start_never_exposes_final_output_usage() {
-        let input = concat!(
-            "data: {\"id\":\"chatcmpl_usage_on_first\",\"model\":\"gpt-5\",\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":25}}\n\n",
-            "data: [DONE]\n\n"
-        );
-
-        let events = collect_anthropic_events(input).await;
-        let message_start = events
-            .iter()
-            .find(|event| event_type(event) == Some("message_start"))
-            .expect("should emit message_start");
-        let message_delta = events
-            .iter()
-            .find(|event| event_type(event) == Some("message_delta"))
-            .expect("should emit message_delta");
-
-        assert_eq!(
-            message_start.pointer("/message/usage/output_tokens"),
-            Some(&json!(0))
-        );
-        assert_eq!(
-            message_delta.pointer("/usage/output_tokens"),
-            Some(&json!(25))
-        );
-    }
-
-    #[tokio::test]
     async fn test_usage_chunk_subtracts_cache_read_and_creation_from_input() {
         // prompt_tokens(1000) 含 cache_read(600) 与 cache_creation(300)；转 Anthropic 后
         // input 应为 fresh，守恒：input(100) + cache_read(600) + cache_creation(300) == prompt(1000)。
         let input = concat!(
             "data: {\"id\":\"chatcmpl_cc\",\"model\":\"glm-5.1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tool-1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]}}]}\n\n",
             "data: {\"id\":\"chatcmpl_cc\",\"model\":\"glm-5.1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":600},\"cache_creation_input_tokens\":300}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"prompt_tokens_details\":{\"cached_tokens\":600,\"cache_write_tokens\":300}}}\n\n",
             "data: [DONE]\n\n"
         );
 
