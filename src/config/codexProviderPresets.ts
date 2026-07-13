@@ -53,7 +53,7 @@ export function generateThirdPartyAuth(apiKey: string): Record<string, any> {
 export function generateThirdPartyConfig(
   providerName: string,
   baseUrl: string,
-  modelName = "gpt-5.5",
+  modelName = "gpt-5.6-sol",
 ): string {
   const tomlString = (value: string) => JSON.stringify(value);
 
@@ -1458,14 +1458,21 @@ model = "gpt-5.5"
 model_reasoning_effort = "high"
 disable_response_storage = true
 personality = "pragmatic"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
 
 [model_providers.custom]
 name = "E-FlowCode"
 base_url = "https://e-flowcode.cc/v1"
 wire_api = "responses"
-requires_openai_auth = true
-model_context_window = 1000000
-model_auto_compact_token_limit = 9000000`,
+requires_openai_auth = true`,
+    modelCatalog: modelCatalog([
+      {
+        model: "gpt-5.5",
+        displayName: "GPT-5.5",
+        contextWindow: 1000000,
+      },
+    ]),
     category: "third_party",
     endpointCandidates: ["https://e-flowcode.cc/v1"],
     icon: "eflowcode",

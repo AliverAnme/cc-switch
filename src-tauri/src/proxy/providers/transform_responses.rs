@@ -143,7 +143,12 @@ pub fn anthropic_to_responses(
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let response_tools: Vec<Value> = tools
             .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
+            .filter(|t| {
+                t.get("type").and_then(|v| v.as_str()) != Some("BatchTool")
+                    && t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+            })
             .map(|t| {
                 let mut tool = json!({
                     "type": "function",
@@ -174,6 +179,26 @@ pub fn anthropic_to_responses(
 
     if let Some(v) = body.get("tool_choice") {
         result["tool_choice"] = map_tool_choice_to_responses(v);
+        if super::transform::anthropic_disables_parallel_tool_use(v) {
+            result["parallel_tool_calls"] = json!(false);
+        }
+    }
+
+    // Third-party Responses backends reject a tool_choice without a non-empty
+    // tools array. In particular, all-Anthropic BatchTool input is filtered
+    // above because it has no OpenAI equivalent, so its paired controls must
+    // be filtered too. Codex OAuth owns a narrower required-field contract and
+    // installs its empty tools default below, so leave that path untouched.
+    if !is_codex_oauth {
+        let has_tools = result
+            .get("tools")
+            .is_some_and(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
+        if !has_tools {
+            if let Some(object) = result.as_object_mut() {
+                object.remove("tool_choice");
+                object.remove("parallel_tool_calls");
+            }
+        }
     }
 
     // Inject prompt_cache_key for improved cache routing on OpenAI-compatible endpoints
@@ -259,6 +284,9 @@ pub fn anthropic_to_responses(
 
 fn map_tool_choice_to_responses(tool_choice: &Value) -> Value {
     match tool_choice {
+        // Anthropic accepts both its object form and the legacy string form.
+        // Responses has no `any` enum: the equivalent is `required`.
+        Value::String(value) if value == "any" => json!("required"),
         Value::String(_) => tool_choice.clone(),
         Value::Object(obj) => match obj.get("type").and_then(|t| t.as_str()) {
             // Anthropic "any" means at least one tool call is required
@@ -967,7 +995,22 @@ mod tests {
             "model": "gpt-4o",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "any"}
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["tool_choice"], "required");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_string_tool_choice_any_to_required() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": "any"
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
@@ -980,12 +1023,28 @@ mod tests {
             "model": "gpt-4o",
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "tool", "name": "get_weather"}
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
         assert_eq!(result["tool_choice"]["type"], "function");
         assert_eq!(result["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_preserves_disable_parallel_tool_use() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["tool_choice"], "required");
+        assert_eq!(result["parallel_tool_calls"], false);
     }
 
     #[test]
@@ -1938,6 +1997,40 @@ mod tests {
             result.get("tools").is_none(),
             "非 Codex OAuth 路径下 tools 在客户端未送时不应被注入"
         );
+    }
+
+    #[test]
+    fn test_non_codex_drops_tool_controls_when_batch_tools_are_filtered() {
+        let input = json!({
+            "model": "gpt-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"type": "BatchTool", "name": "batch"}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_non_codex_drops_tool_controls_when_tool_names_are_empty() {
+        let input = json!({
+            "model": "gpt-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": " ", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
     }
 
     // ==================== Usage Field Robustness Tests ====================

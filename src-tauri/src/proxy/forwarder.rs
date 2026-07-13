@@ -1788,6 +1788,9 @@ impl RequestForwarder {
         let mut saw_user_agent = false;
         let mut saw_anthropic_beta = false;
         let mut saw_anthropic_version = false;
+        // RFC 9110: names listed by Connection are hop-by-hop too, even when
+        // they are non-standard extension headers.
+        let connection_listed_headers = connection_listed_header_names(headers);
 
         for (key, value) in headers {
             let key_str = key.as_str();
@@ -1802,11 +1805,29 @@ impl RequestForwarder {
                 continue;
             }
 
+            if connection_listed_headers.iter().any(|name| name == key) {
+                continue;
+            }
+
             // --- 连接 / 追踪 / CDN 类 — 无条件跳过 ---
             if matches!(
                 key_str,
                 "content-length"
                     | "transfer-encoding"
+                    // The local proxy has already consumed the complete body before
+                    // creating this upstream request. Replaying Expect: 100-continue
+                    // would advertise a handshake that can no longer happen.
+                    | "expect"
+                    | "connection"
+                    | "keep-alive"
+                    | "cookie"
+                    | "proxy-authorization"
+                    | "proxy-authenticate"
+                    | "proxy-connection"
+                    | "te"
+                    | "trailer"
+                    | "trailers"
+                    | "upgrade"
                     | "x-forwarded-host"
                     | "x-forwarded-port"
                     | "x-forwarded-proto"
@@ -2008,7 +2029,8 @@ impl RequestForwarder {
 
         // 序列化请求体。GET/HEAD 是 idempotent/safe 方法，按 HTTP 语义不应携带 body；
         // 强行附带 JSON body 会让某些上游（如 Google Gemini 的 models.list）拒绝请求。
-        let body_bytes = if matches!(method, &http::Method::GET | &http::Method::HEAD) {
+        let method_allows_body = !matches!(method, &http::Method::GET | &http::Method::HEAD);
+        let body_bytes = if !method_allows_body {
             Vec::new()
         } else {
             serde_json::to_vec(&filtered_body).map_err(|e| {
@@ -2016,8 +2038,10 @@ impl RequestForwarder {
             })?
         };
 
-        // 确保 content-type 存在
-        if !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
+        // 仅为实际携带 JSON body 的请求补 Content-Type。GET/HEAD 没有实体，凭空
+        // 注入 application/json 可能使严格的只读 API（如 models.list）拒绝请求。
+        // 客户端显式提供的 Content-Type 仍原样保留。
+        if method_allows_body && !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
             ordered_headers.insert(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/json"),
@@ -2041,15 +2065,15 @@ impl RequestForwarder {
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        log::info!("[{tag}] >>> 请求 URL: {url} (model={request_model})");
+        log::info!(
+            "[{tag}] >>> 请求 URL: {} (model={request_model})",
+            redact_url_for_log(&url)
+        );
         if log::log_enabled!(log::Level::Debug) {
-            if let Ok(body_str) = serde_json::to_string(&filtered_body) {
-                log::debug!(
-                    "[{tag}] >>> 请求体内容 ({}字节): {}",
-                    body_str.len(),
-                    body_str
-                );
-            }
+            log::debug!(
+                "[{tag}] >>> 请求体元数据 ({})",
+                request_body_log_summary(&filtered_body)
+            );
         }
 
         // 确定超时
@@ -2082,7 +2106,7 @@ impl RequestForwarder {
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
-            let client = super::http_client::get();
+            let client = super::http_client::get_forward();
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
@@ -2135,6 +2159,15 @@ impl RequestForwarder {
         // 检查响应状态
         let status = response.status();
 
+        // A proxy request must never relay or follow an upstream redirect.
+        // The reqwest path uses a no-redirect client to match Hyper, and the
+        // proxy deliberately does not preserve Location for API calls. Returning
+        // a 3xx without Location leaves clients with a broken redirect contract;
+        // treat it as a retryable bad gateway instead.
+        if status.is_redirection() {
+            return Err(upstream_redirect_error(status));
+        }
+
         if status.is_success() {
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
@@ -2155,7 +2188,9 @@ impl RequestForwarder {
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
             let encoding = get_content_encoding(response.headers());
-            let raw = response.bytes().await?;
+            let raw = response
+                .bytes_limited(super::hyper_client::MAX_BUFFERED_PROXY_BODY_BYTES)
+                .await?;
             let decoded = match encoding {
                 Some(encoding) => match decompress_body(&encoding, &raw) {
                     Ok(Some(decompressed)) => decompressed,
@@ -2193,14 +2228,17 @@ impl RequestForwarder {
         let status = response.status();
         let headers = response.headers().clone();
         let body_timeout = self.non_streaming_timeout;
-        let body = tokio::time::timeout(body_timeout, response.bytes())
-            .await
-            .map_err(|_| {
-                ProxyError::Timeout(format!(
-                    "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
-                    body_timeout.as_secs()
-                ))
-            })??;
+        let body = tokio::time::timeout(
+            body_timeout,
+            response.bytes_limited(super::hyper_client::MAX_BUFFERED_PROXY_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Timeout(format!(
+                "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
+                body_timeout.as_secs()
+            ))
+        })??;
 
         Ok(ProxyResponse::buffered(status, headers, body))
     }
@@ -2215,7 +2253,9 @@ impl RequestForwarder {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
-        let raw = response.bytes().await?;
+        let raw = response
+            .bytes_limited(super::hyper_client::MAX_BUFFERED_PROXY_BODY_BYTES)
+            .await?;
         let decoded = match encoding {
             Some(encoding) => match decompress_body(&encoding, &raw) {
                 Ok(Some(decompressed)) => decompressed,
@@ -2387,12 +2427,11 @@ impl RequestForwarder {
             //   405 Method Not Allowed / 406 Not Acceptable  ← 方法或 Accept 错误
             //   413 Payload Too Large / 414 URI Too Long     ← 客户端构造超限
             //   415 Unsupported Media Type                    ← Content-Type 错误
-            //   501 Not Implemented                           ← 上游协议确实不支持
             //
-            // 其他 4xx（401/403/404/408/409/429/451 等）和全部 5xx 都保留
+            // 其他 4xx（401/403/404/408/409/429/451 等）、501 和全部 5xx 都保留
             // Retryable —— 换一家 provider 可能持有不同的 key、配额、地域或模型映射。
             ProxyError::UpstreamError { status, .. } => match *status {
-                400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
+                400 | 405 | 406 | 413 | 414 | 415 | 422 => ErrorCategory::NonRetryable,
                 _ => ErrorCategory::Retryable,
             },
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
@@ -2408,12 +2447,83 @@ impl RequestForwarder {
     }
 }
 
+fn upstream_redirect_error(status: http::StatusCode) -> ProxyError {
+    ProxyError::ForwardFailed(format!(
+        "Upstream returned HTTP {} redirect; redirects are not followed by the local proxy",
+        status.as_u16()
+    ))
+}
+
 /// 从 ProxyError 中提取错误消息
 fn extract_error_message(error: &ProxyError) -> Option<String> {
     match error {
         ProxyError::UpstreamError { body, .. } => body.clone(),
         _ => Some(error.to_string()),
     }
+}
+
+/// Produce request diagnostics without retaining prompts, tool arguments,
+/// inline images, or other user-provided values in debug logs.
+fn request_body_log_summary(body: &Value) -> String {
+    let byte_len = serde_json::to_vec(body)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let top_level_fields = body
+        .as_object()
+        .map(|object| {
+            let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+            fields.sort_unstable();
+            if fields.len() > 16 {
+                fields.truncate(16);
+                fields.push("…");
+            }
+            fields.join(",")
+        })
+        .unwrap_or_else(|| "<non-object>".to_string());
+    format!("{byte_len} bytes; fields=[{top_level_fields}]")
+}
+
+fn redact_url_for_log(url: &str) -> String {
+    const SENSITIVE_QUERY_NAMES: &[&str] = &[
+        "key",
+        "api_key",
+        "api-key",
+        "apikey",
+        "x-api-key",
+        "x-goog-api-key",
+        "subscription-key",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "token",
+        "signature",
+        "sig",
+        "authorization",
+        "auth",
+    ];
+
+    let Some((base, query_and_fragment)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    // Fragments are never part of an HTTP request target. They can still be
+    // present in a client-supplied URL, so omit them from diagnostics rather
+    // than treating them as safe routing data.
+    let query = query_and_fragment
+        .split_once('#')
+        .map(|(query, _)| query)
+        .unwrap_or(query_and_fragment);
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if SENSITIVE_QUERY_NAMES
+            .iter()
+            .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+        {
+            serializer.append_pair(&name, "<redacted>");
+        } else {
+            serializer.append_pair(&name, &value);
+        }
+    }
+    format!("{base}?{}", serializer.finish())
 }
 
 /// 检测 Provider 是否为 Bedrock（通过 CLAUDE_CODE_USE_BEDROCK 环境变量判断）
@@ -2863,7 +2973,12 @@ fn is_streaming_request(endpoint: &str, body: &Value, headers: &axum::http::Head
     headers
         .get(axum::http::header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .map(|accept| accept.contains("text/event-stream"))
+        .map(|accept| {
+            accept
+                .split(',')
+                .map(|media_range| media_range.split(';').next().unwrap_or("").trim())
+                .any(|media_type| media_type.eq_ignore_ascii_case("text/event-stream"))
+        })
         .unwrap_or(false)
 }
 
@@ -2998,13 +3113,30 @@ fn apply_local_proxy_header_overrides(
     }
 }
 
+/// Extract extension header names declared as hop-by-hop by an incoming
+/// `Connection` header. Invalid tokens are ignored because they cannot name a
+/// valid HTTP header anyway.
+fn connection_listed_header_names(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+        .collect()
+}
+
 fn is_protected_local_proxy_override_header(name: &http::HeaderName) -> bool {
     matches!(
         name.as_str(),
         "host"
             | "content-length"
             | "transfer-encoding"
+            | "expect"
             | "connection"
+            | "cookie"
             | "proxy-authorization"
             | "proxy-authenticate"
             | "te"
@@ -3081,7 +3213,7 @@ fn log_prompt_cache_trace(
         "[CacheTrace] app={}, provider={}, endpoint={}, api_format={}, session_client_provided={}, prompt_cache_key={}, store={}, stream={}, instructions_hash={}, tools_hash={}, input_hash={}, include_hash={}, body_hash={}",
         app_type.as_str(),
         provider.id,
-        endpoint,
+        redact_url_for_log(endpoint),
         api_format.unwrap_or("native"),
         session_client_provided,
         prompt_cache_key,
@@ -3166,6 +3298,36 @@ mod tests {
     }
 
     #[test]
+    fn request_body_log_summary_never_includes_request_values() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": "top secret prompt",
+            "tools": [{"name": "read_file", "parameters": {"path": "/private/key"}}]
+        });
+
+        let summary = request_body_log_summary(&body);
+
+        assert!(summary.contains("fields=[input,model,tools]"));
+        assert!(!summary.contains("top secret prompt"));
+        assert!(!summary.contains("/private/key"));
+        assert!(!summary.contains("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn redact_url_for_log_preserves_routing_query_and_redacts_credentials() {
+        let redacted = redact_url_for_log(
+            "https://generativelanguage.googleapis.com/v1beta/models?key=secret&x-goog-api-key=google-secret&alt=sse&access_token=also-secret#fragment",
+        );
+
+        assert!(redacted.contains("key=%3Credacted%3E"));
+        assert!(redacted.contains("x-goog-api-key=%3Credacted%3E"));
+        assert!(redacted.contains("access_token=%3Credacted%3E"));
+        assert!(redacted.contains("alt=sse"));
+        assert!(!redacted.contains("fragment"));
+        assert!(!redacted.contains("secret"));
+    }
+
+    #[test]
     fn single_provider_retryable_log_uses_single_provider_code() {
         let error = ProxyError::UpstreamError {
             status: 429,
@@ -3179,6 +3341,22 @@ mod tests {
         assert!(message.contains("上游 HTTP 429"));
         assert!(message.contains("rate limit exceeded"));
         assert!(!message.contains("切换下一个"));
+    }
+
+    #[test]
+    fn upstream_not_implemented_is_retryable_for_provider_failover() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let error = ProxyError::UpstreamError {
+            status: 501,
+            body: Some(
+                r#"{"error":{"message":"responses endpoint is not implemented"}}"#.to_string(),
+            ),
+        };
+
+        assert_eq!(
+            forwarder.categorize_proxy_error(&error),
+            ErrorCategory::Retryable
+        );
     }
 
     #[test]
@@ -3228,6 +3406,38 @@ mod tests {
         let summary = summarize_text_for_log("line1\n\n line2   line3", 12);
 
         assert_eq!(summary, "line1 line2...");
+    }
+
+    #[test]
+    fn upstream_redirect_is_normalized_to_a_gateway_error() {
+        let error = upstream_redirect_error(StatusCode::TEMPORARY_REDIRECT);
+
+        match error {
+            ProxyError::ForwardFailed(message) => {
+                assert!(message.contains("307"));
+                assert!(message.contains("not followed"));
+            }
+            other => panic!("expected ForwardFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_header_extensions_are_identified_as_hop_by_hop() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-local-hop, X-Another-Hop"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+
+        let listed = connection_listed_header_names(&headers);
+
+        assert!(listed.contains(&http::HeaderName::from_static("x-local-hop")));
+        assert!(listed.contains(&http::HeaderName::from_static("x-another-hop")));
+        assert!(listed.contains(&http::header::UPGRADE));
     }
 
     #[test]
@@ -3365,6 +3575,9 @@ mod tests {
                 ("User-Agent".to_string(), "custom".to_string()),
                 ("X-Test".to_string(), "ok".to_string()),
                 ("Authorization".to_string(), "Bearer bad".to_string()),
+                ("Cookie".to_string(), "session=leak".to_string()),
+                ("Proxy-Authorization".to_string(), "Basic leak".to_string()),
+                ("Expect".to_string(), "100-continue".to_string()),
                 ("Content-Type".to_string(), "text/plain".to_string()),
                 ("X-Bad".to_string(), "bad\nvalue".to_string()),
             ]),
@@ -3396,6 +3609,9 @@ mod tests {
             Some("ok")
         );
         assert!(headers.get("x-bad").is_none());
+        assert!(headers.get(http::header::COOKIE).is_none());
+        assert!(headers.get("proxy-authorization").is_none());
+        assert!(headers.get(http::header::EXPECT).is_none());
     }
 
     #[test]
@@ -3438,7 +3654,10 @@ mod tests {
             .expect("response should be buffered");
 
         assert_eq!(
-            prepared.bytes().await.unwrap(),
+            prepared
+                .bytes_limited(super::super::hyper_client::MAX_BUFFERED_PROXY_BODY_BYTES)
+                .await
+                .unwrap(),
             Bytes::from_static(b"{\"ok\":true}")
         );
     }
@@ -3483,7 +3702,10 @@ mod tests {
             .expect("stream should be primed");
 
         assert_eq!(
-            prepared.bytes().await.unwrap(),
+            prepared
+                .bytes_limited(super::super::hyper_client::MAX_BUFFERED_PROXY_BODY_BYTES)
+                .await
+                .unwrap(),
             Bytes::from_static(b"firstsecond")
         );
     }
@@ -3979,6 +4201,21 @@ mod tests {
     fn force_identity_for_sse_accept_header() {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+
+        assert!(should_force_identity_encoding(
+            "/v1/responses",
+            &json!({ "model": "gpt-5" }),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn force_identity_for_case_insensitive_sse_accept_header_with_other_media_ranges() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, Text/Event-Stream; q=0.8"),
+        );
 
         assert!(should_force_identity_encoding(
             "/v1/responses",

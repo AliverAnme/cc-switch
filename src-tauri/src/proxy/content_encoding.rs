@@ -5,7 +5,63 @@
 //! 共用同一套解压逻辑。
 
 use axum::http::header::HeaderMap;
-use std::io::Read;
+use std::io::{Read, Write};
+
+/// Keep decoded payloads within the proxy's inbound `DefaultBodyLimit`.
+/// A small compressed request must not be allowed to expand beyond the maximum
+/// body size accepted from an uncompressed client.
+const MAX_DECOMPRESSED_BODY_BYTES: usize = 200 * 1024 * 1024;
+const DECOMPRESSED_BODY_LIMIT_ERROR: &str = "decompressed body exceeds configured limit";
+
+fn decompressed_body_limit_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{DECOMPRESSED_BODY_LIMIT_ERROR} of {limit} bytes"),
+    )
+}
+
+fn is_decompressed_body_limit_error(error: &std::io::Error) -> bool {
+    error.to_string().starts_with(DECOMPRESSED_BODY_LIMIT_ERROR)
+}
+
+fn read_to_end_limited<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut decompressed = Vec::new();
+    reader
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut decompressed)?;
+    if decompressed.len() > limit {
+        return Err(decompressed_body_limit_error(limit));
+    }
+    Ok(decompressed)
+}
+
+struct LimitedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl LimitedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        if buf.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(decompressed_body_limit_error(self.limit));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
 
 /// 把 content-encoding 值拆成有序 coding 列表（去掉 identity 与空值）。
 ///
@@ -15,53 +71,61 @@ fn split_codings(content_encoding: &str) -> Vec<&str> {
     content_encoding
         .split(',')
         .map(str::trim)
-        .filter(|c| !c.is_empty() && *c != "identity")
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("identity"))
         .collect()
 }
 
 /// 单个 coding 是否可被解压。
 fn is_single_supported(coding: &str) -> bool {
+    let coding = coding.to_ascii_lowercase();
     matches!(
-        coding,
+        coding.as_str(),
         "gzip" | "x-gzip" | "deflate" | "br" | "zstd" | "zst"
     )
 }
 
 /// 解压单个 content-coding。未知编码返回 `Ok(None)`。
 fn decompress_single(coding: &str, body: &[u8]) -> Result<Option<Vec<u8>>, std::io::Error> {
-    match coding {
+    match coding.to_ascii_lowercase().as_str() {
         "gzip" | "x-gzip" => {
             let mut decoder = flate2::read::GzDecoder::new(body);
-            let mut decompressed = Vec::new();
-            decoder.read_to_end(&mut decompressed)?;
-            Ok(Some(decompressed))
+            Ok(Some(read_to_end_limited(
+                &mut decoder,
+                MAX_DECOMPRESSED_BODY_BYTES,
+            )?))
         }
         "deflate" => {
             // RFC 9110: deflate 指 zlib 包裹格式；但部分上游 / 客户端发 raw deflate 流。
             // 先按规范尝试 zlib，失败再回退 raw —— 否则合规来源必然解压失败，
             // 原始压缩字节会被 fail-open 透传给 JSON 解析（#2234 形态 C 之一）。
-            let mut decompressed = Vec::new();
             let mut zlib = flate2::read::ZlibDecoder::new(body);
-            match zlib.read_to_end(&mut decompressed) {
-                Ok(_) => Ok(Some(decompressed)),
+            match read_to_end_limited(&mut zlib, MAX_DECOMPRESSED_BODY_BYTES) {
+                Ok(decompressed) => Ok(Some(decompressed)),
                 Err(zlib_err) => {
+                    if is_decompressed_body_limit_error(&zlib_err) {
+                        return Err(zlib_err);
+                    }
                     log::debug!("deflate 按 zlib 解压失败（{zlib_err}），回退 raw deflate");
-                    let mut decompressed = Vec::new();
                     let mut raw = flate2::read::DeflateDecoder::new(body);
-                    raw.read_to_end(&mut decompressed)?;
-                    Ok(Some(decompressed))
+                    Ok(Some(read_to_end_limited(
+                        &mut raw,
+                        MAX_DECOMPRESSED_BODY_BYTES,
+                    )?))
                 }
             }
         }
         "br" => {
-            let mut decompressed = Vec::new();
+            let mut decompressed = LimitedWriter::new(MAX_DECOMPRESSED_BODY_BYTES);
             brotli::BrotliDecompress(&mut std::io::Cursor::new(body), &mut decompressed)?;
-            Ok(Some(decompressed))
+            Ok(Some(decompressed.bytes))
         }
         "zstd" | "zst" => {
             // Codex 登录态对请求体启用 zstd（Compression::Zstd）；上游也可能 zstd 压缩响应。
-            let decompressed = zstd::stream::decode_all(std::io::Cursor::new(body))?;
-            Ok(Some(decompressed))
+            let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
+            Ok(Some(read_to_end_limited(
+                &mut decoder,
+                MAX_DECOMPRESSED_BODY_BYTES,
+            )?))
         }
         _ => Ok(None),
     }
@@ -131,6 +195,24 @@ pub(crate) fn get_content_encoding(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn read_to_end_limited_rejects_payload_above_limit() {
+        let err = read_to_end_limited(&mut Cursor::new(b"12345"), 4).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(is_decompressed_body_limit_error(&err));
+    }
+
+    #[test]
+    fn limited_writer_rejects_payload_above_limit() {
+        let mut writer = LimitedWriter::new(4);
+        let err = writer.write(b"12345").unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(is_decompressed_body_limit_error(&err));
+    }
 
     #[test]
     fn decompress_body_deflate_handles_zlib_wrapped_per_rfc9110() {
@@ -177,6 +259,20 @@ mod tests {
         let stacked = zstd::stream::encode_all(std::io::Cursor::new(&gzipped[..]), 0).unwrap();
 
         let decompressed = decompress_body("gzip, zstd", &stacked).unwrap().unwrap();
+        assert_eq!(decompressed, payload);
+    }
+
+    #[test]
+    fn content_coding_tokens_are_case_insensitive() {
+        let payload = br#"{\"case\":\"insensitive\"}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        assert!(is_supported_content_encoding("GZip, IDENTITY"));
+        let decompressed = decompress_body("GZip, IDENTITY", &compressed)
+            .unwrap()
+            .unwrap();
         assert_eq!(decompressed, payload);
     }
 

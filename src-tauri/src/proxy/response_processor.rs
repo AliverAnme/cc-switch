@@ -7,7 +7,7 @@ use super::{
     forwarder::ActiveConnectionGuard,
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
-    hyper_client::ProxyResponse,
+    hyper_client::{ProxyResponse, MAX_BUFFERED_PROXY_BODY_BYTES},
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
@@ -46,7 +46,20 @@ const HOP_BY_HOP_RESPONSE_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// 移除响应侧 hop-by-hop 头，以及 `Connection` 中点名的扩展头。
+/// CORS policy belongs to the local proxy origin, never to a selected upstream.
+/// This server does not expose a browser CORS policy, so an upstream must not be
+/// able to opt callers into cross-origin access to localhost by proxying these.
+const UPSTREAM_CORS_RESPONSE_HEADERS: &[&str] = &[
+    "access-control-allow-credentials",
+    "access-control-allow-headers",
+    "access-control-allow-methods",
+    "access-control-allow-origin",
+    "access-control-expose-headers",
+    "access-control-max-age",
+];
+
+/// 移除响应侧 hop-by-hop 头、`Connection` 中点名的扩展头，以及不应由第三方
+/// 上游控制本地代理客户端状态或跨域策略的响应头。
 pub(crate) fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
     let connection_listed_headers: Vec<HeaderName> = headers
         .get_all(axum::http::header::CONNECTION)
@@ -59,6 +72,13 @@ pub(crate) fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
         .collect();
 
     for name in HOP_BY_HOP_RESPONSE_HEADERS {
+        headers.remove(*name);
+    }
+    // The response is served from the local proxy origin, not the upstream
+    // origin. Forwarding this end-to-end header would let any selected provider
+    // set cookies for localhost / the proxy host in the calling client.
+    headers.remove(axum::http::header::SET_COOKIE);
+    for name in UPSTREAM_CORS_RESPONSE_HEADERS {
         headers.remove(*name);
     }
 
@@ -76,7 +96,7 @@ pub(crate) fn strip_entity_headers_for_rebuilt_body(headers: &mut HeaderMap) {
 
 /// 读取响应体并在需要时解压，确保 headers 与返回 body 一致。
 ///
-/// `body_timeout`: 整包超时。当非零时用 `tokio::time::timeout` 包住 `.bytes()` 调用，
+/// `body_timeout`: 整包超时。当非零时用 `tokio::time::timeout` 包住受限读取，
 /// 防止上游发完响应头后卡住 body 导致请求永远挂住。
 /// 传入 `Duration::ZERO` 表示不启用超时（故障转移关闭时）。
 pub(crate) async fn read_decoded_body(
@@ -87,16 +107,21 @@ pub(crate) async fn read_decoded_body(
     let mut headers = response.headers().clone();
     let status = response.status();
     let raw_bytes = if body_timeout.is_zero() {
-        response.bytes().await?
+        response
+            .bytes_limited(MAX_BUFFERED_PROXY_BODY_BYTES)
+            .await?
     } else {
-        tokio::time::timeout(body_timeout, response.bytes())
-            .await
-            .map_err(|_| {
-                ProxyError::Timeout(format!(
-                    "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
-                    body_timeout.as_secs()
-                ))
-            })??
+        tokio::time::timeout(
+            body_timeout,
+            response.bytes_limited(MAX_BUFFERED_PROXY_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            ProxyError::Timeout(format!(
+                "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
+                body_timeout.as_secs()
+            ))
+        })??
     };
 
     log::debug!(
@@ -225,9 +250,9 @@ pub async fn handle_non_streaming(
     strip_hop_by_hop_response_headers(&mut response_headers);
 
     log::debug!(
-        "[{}] 上游响应体内容: {}",
+        "[{}] 已缓冲上游非流式响应: {} bytes",
         ctx.tag,
-        String::from_utf8_lossy(&body_bytes)
+        body_bytes.len()
     );
 
     // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
@@ -802,11 +827,28 @@ fn format_headers(headers: &HeaderMap) -> String {
     headers
         .iter()
         .map(|(key, value)| {
-            let value_str = value.to_str().unwrap_or("<non-utf8>");
+            let value_str = if is_sensitive_header_for_log(key.as_str()) {
+                "<redacted>"
+            } else {
+                value.to_str().unwrap_or("<non-utf8>")
+            };
             format!("{key}={value_str}")
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn is_sensitive_header_for_log(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-anthropic-api-key"
+    )
 }
 
 #[cfg(test)]
@@ -823,6 +865,31 @@ mod tests {
     use crate::proxy::types::{ProxyConfig, ProxyStatus};
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+
+    #[test]
+    fn format_headers_redacts_credentials_and_cookies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            axum::http::HeaderValue::from_static("Bearer secret-token"),
+        );
+        headers.insert(
+            "set-cookie",
+            axum::http::HeaderValue::from_static("session=secret"),
+        );
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let formatted = format_headers(&headers);
+
+        assert!(formatted.contains("authorization=<redacted>"));
+        assert!(formatted.contains("set-cookie=<redacted>"));
+        assert!(formatted.contains("content-type=application/json"));
+        assert!(!formatted.contains("secret-token"));
+        assert!(!formatted.contains("session=secret"));
+    }
     use std::str::FromStr;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -875,6 +942,22 @@ mod tests {
             axum::http::header::CONTENT_LENGTH,
             axum::http::HeaderValue::from_static("12"),
         );
+        headers.append(
+            axum::http::header::SET_COOKIE,
+            axum::http::HeaderValue::from_static("upstream_session=secret; Path=/"),
+        );
+        headers.append(
+            axum::http::header::SET_COOKIE,
+            axum::http::HeaderValue::from_static("tracking=1; Path=/"),
+        );
+        headers.insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            axum::http::HeaderValue::from_static("https://untrusted.example"),
+        );
+        headers.insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            axum::http::HeaderValue::from_static("true"),
+        );
 
         strip_hop_by_hop_response_headers(&mut headers);
 
@@ -882,6 +965,9 @@ mod tests {
         assert!(!headers.contains_key("keep-alive"));
         assert!(!headers.contains_key(axum::http::header::TRANSFER_ENCODING));
         assert!(!headers.contains_key("proxy-connection"));
+        assert!(!headers.contains_key(axum::http::header::SET_COOKIE));
+        assert!(!headers.contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        assert!(!headers.contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE),
             Some(&axum::http::HeaderValue::from_static("application/json"))

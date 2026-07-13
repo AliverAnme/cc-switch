@@ -83,10 +83,17 @@ pub fn anthropic_to_gemini_with_shadow(
         result["generationConfig"] = generation_config;
     }
 
+    let mut has_function_declarations = false;
     if let Some(tools) = body.get("tools").and_then(|value| value.as_array()) {
         let function_declarations: Vec<Value> = tools
             .iter()
-            .filter(|tool| tool.get("type").and_then(|value| value.as_str()) != Some("BatchTool"))
+            .filter(|tool| {
+                tool.get("type").and_then(|value| value.as_str()) != Some("BatchTool")
+                    && tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+            })
             .map(|tool| {
                 build_gemini_function_declaration(
                     tool.get("name")
@@ -101,12 +108,19 @@ pub fn anthropic_to_gemini_with_shadow(
             .collect();
 
         if !function_declarations.is_empty() {
+            has_function_declarations = true;
             result["tools"] = json!([{ "functionDeclarations": function_declarations }]);
         }
     }
 
-    if let Some(tool_config) = map_tool_choice(body.get("tool_choice"))? {
-        result["toolConfig"] = tool_config;
+    // Gemini accepts functionCallingConfig only together with at least one
+    // function declaration.  BatchTool-only Anthropic requests lose all
+    // callable tools during conversion, so retaining toolConfig would turn an
+    // otherwise valid request into a strict upstream 400.
+    if has_function_declarations {
+        if let Some(tool_config) = map_tool_choice(body.get("tool_choice"))? {
+            result["toolConfig"] = tool_config;
+        }
     }
 
     Ok(result)
@@ -406,6 +420,10 @@ fn build_generation_config(body: &Value) -> Option<Value> {
         == Some("json_schema")
     {
         if let Some(schema) = body.pointer("/output_config/format/schema") {
+            // Gemini GenerateContent requires responseMimeType when a
+            // responseJsonSchema is present; without it strict upstreams
+            // reject the request instead of enabling structured output.
+            config.insert("responseMimeType".to_string(), json!("application/json"));
             config.insert("responseJsonSchema".to_string(), schema.clone());
         }
     }
@@ -1197,6 +1215,9 @@ fn map_tool_choice(tool_choice: Option<&Value>) -> Result<Option<Value>, ProxyEr
             "none" => Some(json!({
                 "functionCallingConfig": { "mode": "NONE" }
             })),
+            "any" => Some(json!({
+                "functionCallingConfig": { "mode": "ANY" }
+            })),
             other => {
                 return Err(ProxyError::TransformError(format!(
                     "Unsupported Gemini tool_choice string: {other}"
@@ -1345,6 +1366,10 @@ mod tests {
 
         let result = anthropic_to_gemini(input).unwrap();
         assert_eq!(
+            result["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
             result["generationConfig"]["responseJsonSchema"]["required"][0],
             "name"
         );
@@ -1465,6 +1490,47 @@ mod tests {
             result["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"][0],
             "get_weather"
         );
+    }
+
+    #[test]
+    fn anthropic_to_gemini_maps_string_any_tool_choice() {
+        let input = json!({
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [{
+                "name": "get_weather",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_choice": "any"
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(result["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    }
+
+    #[test]
+    fn anthropic_to_gemini_drops_tool_config_when_all_tools_are_filtered() {
+        let input = json!({
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [{"type": "BatchTool"}],
+            "tool_choice": {"type": "any", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert!(result.get("tools").is_none());
+        assert!(result.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_gemini_drops_tool_config_when_tool_names_are_empty() {
+        let input = json!({
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [{"name": " ", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"}
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert!(result.get("tools").is_none());
+        assert!(result.get("toolConfig").is_none());
     }
 
     #[test]

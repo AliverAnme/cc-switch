@@ -10,6 +10,11 @@ export default defineConfig({
     },
   },
   test: {
+    // This repository contains vendored tools, plugin worktrees, and local
+    // analysis checkouts that each carry their own test suites. Restrict the
+    // root runner to cc-switch's test tree so `pnpm test:unit` is deterministic
+    // and does not execute nested projects with incompatible fixtures.
+    include: ["tests/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
     environment: "jsdom",
     setupFiles: ["./tests/setupGlobals.ts", "./tests/setupTests.ts"],
     globals: true,

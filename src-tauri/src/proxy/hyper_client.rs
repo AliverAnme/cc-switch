@@ -91,6 +91,12 @@ pub enum ProxyResponse {
     },
 }
 
+/// Maximum raw body retained in memory by a non-streaming proxy path.
+///
+/// This aligns buffered upstream responses with the local proxy's 200 MiB
+/// request limit. Streaming paths deliberately remain unbuffered.
+pub const MAX_BUFFERED_PROXY_BODY_BYTES: usize = 200 * 1024 * 1024;
+
 impl ProxyResponse {
     pub fn buffered(status: http::StatusCode, headers: http::HeaderMap, body: Bytes) -> Self {
         Self::Buffered {
@@ -138,7 +144,11 @@ impl ProxyResponse {
     /// Check if the response is an SSE stream.
     pub fn is_sse(&self) -> bool {
         self.content_type()
-            .map(|ct| ct.contains("text/event-stream"))
+            .map(|ct| {
+                ct.split(';').next().is_some_and(|media_type| {
+                    media_type.trim().eq_ignore_ascii_case("text/event-stream")
+                })
+            })
             .unwrap_or(false)
     }
 
@@ -157,30 +167,28 @@ impl ProxyResponse {
             .unwrap_or(false)
     }
 
-    /// Consume the response and collect the full body into `Bytes`.
-    pub async fn bytes(self) -> Result<Bytes, ProxyError> {
-        match self {
-            Self::Hyper(r) => {
-                let collected = r.into_body().collect().await.map_err(|e| {
-                    ProxyError::ForwardFailed(format!("Failed to read response body: {e}"))
-                })?;
-                Ok(collected.to_bytes())
-            }
-            Self::Reqwest(r) => r.bytes().await.map_err(|e| {
+    /// Consume and collect a response body while enforcing a strict byte limit.
+    ///
+    /// `reqwest::Response::bytes` and Hyper's `collect` have no built-in cap;
+    /// transformed non-streaming responses must not let a provider allocate an
+    /// unbounded amount of proxy memory.
+    pub async fn bytes_limited(self, limit: usize) -> Result<Bytes, ProxyError> {
+        let mut stream = Box::pin(self.bytes_stream());
+        let mut body = bytes::BytesMut::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
                 ProxyError::ForwardFailed(format!("Failed to read response body: {e}"))
-            }),
-            Self::Buffered { body, .. } => Ok(body),
-            Self::Streamed { mut stream, .. } => {
-                let mut body = bytes::BytesMut::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| {
-                        ProxyError::ForwardFailed(format!("Failed to read response body: {e}"))
-                    })?;
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(body.freeze())
+            })?;
+            if chunk.len() > limit.saturating_sub(body.len()) {
+                return Err(ProxyError::ForwardFailed(format!(
+                    "Upstream response body exceeds maximum buffered size of {limit} bytes"
+                )));
             }
+            body.extend_from_slice(&chunk);
         }
+
+        Ok(body.freeze())
     }
 
     /// Consume the response and return a byte-chunk stream (for SSE pass-through).
@@ -774,5 +782,32 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[test]
+    fn sse_content_type_detection_is_case_insensitive() {
+        assert!(buffered_with_content_type(Some("Text/Event-Stream; charset=utf-8")).is_sse());
+        assert!(!buffered_with_content_type(Some("application/text/event-stream")).is_sse());
+    }
+
+    #[tokio::test]
+    async fn bytes_limited_rejects_a_stream_larger_than_its_limit() {
+        let response = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            http::HeaderMap::new(),
+            futures::stream::iter(vec![
+                Ok(Bytes::from_static(b"123")),
+                Ok(Bytes::from_static(b"45")),
+            ]),
+        );
+
+        let err = response.bytes_limited(4).await.unwrap_err();
+
+        match err {
+            ProxyError::ForwardFailed(message) => {
+                assert!(message.contains("maximum buffered size"))
+            }
+            other => panic!("expected ForwardFailed, got {other:?}"),
+        }
     }
 }

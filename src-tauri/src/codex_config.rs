@@ -846,12 +846,14 @@ fn load_codex_native_responses_template() -> Value {
 }
 
 fn load_codex_model_catalog_template() -> Result<Value, AppError> {
-    // ① models_cache.json (created by Codex when it connects to OpenAI)
-    if let Some(template) = load_codex_model_template_from_cache()? {
+    // ① Codex CLI (PATH + platform-specific common paths). This is the
+    // authoritative local schema for the installed Codex version; prefer it
+    // over models_cache.json, which can have been written by an older client.
+    if let Some(template) = load_codex_model_template_from_bundled()? {
         return Ok(template);
     }
-    // ② codex CLI (PATH + platform-specific common paths)
-    if let Some(template) = load_codex_model_template_from_bundled()? {
+    // ② models_cache.json (created by Codex when it connects to OpenAI)
+    if let Some(template) = load_codex_model_template_from_cache()? {
         return Ok(template);
     }
     // ③ Static fallback bundled at compile time
@@ -1792,6 +1794,21 @@ mod tests {
             CodexCatalogToolProfile::from_api_format(None),
             CodexCatalogToolProfile::ProxyChat
         );
+    }
+
+    #[test]
+    fn bundled_gpt_5_6_sol_template_matches_current_catalog_contract() {
+        let template = load_codex_model_template_static()
+            .expect("bundled gpt-5.6-sol template must be valid JSON");
+
+        assert_eq!(template["slug"], "gpt-5.6-sol");
+        assert_eq!(template["context_window"], 1_050_000);
+        assert_eq!(template["max_context_window"], 1_050_000);
+        assert_eq!(template["use_responses_lite"], false);
+        assert_eq!(template["shell_type"], "shell_command");
+        assert_eq!(template["apply_patch_tool_type"], "freeform");
+        assert!(template.get("base_instructions").is_some());
+        assert!(template.get("model_messages").is_some());
     }
 
     #[test]

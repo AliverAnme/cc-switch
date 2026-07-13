@@ -28,7 +28,11 @@ impl ResponseType {
     /// 从 Content-Type 检测响应类型
     #[allow(dead_code)]
     pub fn from_content_type(content_type: &str) -> Self {
-        if content_type.contains("text/event-stream") {
+        if content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
             ResponseType::Stream
         } else {
             ResponseType::NonStream
@@ -196,6 +200,10 @@ mod tests {
         );
         assert_eq!(
             ResponseType::from_content_type("text/event-stream; charset=utf-8"),
+            ResponseType::Stream
+        );
+        assert_eq!(
+            ResponseType::from_content_type("Text/Event-Stream; charset=utf-8"),
             ResponseType::Stream
         );
         assert_eq!(

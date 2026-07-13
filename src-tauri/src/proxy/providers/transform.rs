@@ -409,7 +409,12 @@ pub fn anthropic_to_openai_with_reasoning_content(
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let openai_tools: Vec<Value> = tools
             .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
+            .filter(|t| {
+                t.get("type").and_then(|v| v.as_str()) != Some("BatchTool")
+                    && t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty())
+            })
             .map(|t| {
                 let mut tool = json!({
                     "type": "function",
@@ -439,6 +444,22 @@ pub fn anthropic_to_openai_with_reasoning_content(
 
     if let Some(v) = body.get("tool_choice") {
         result["tool_choice"] = map_tool_choice_to_chat(v);
+        if anthropic_disables_parallel_tool_use(v) {
+            result["parallel_tool_calls"] = json!(false);
+        }
+    }
+
+    // A tool_choice without any surviving tools is invalid for strict OpenAI
+    // compatible gateways. This can happen when the input only contained
+    // Anthropic-hosted BatchTool entries, which have no Chat equivalent.
+    let has_tools = result
+        .get("tools")
+        .is_some_and(|tools| tools.as_array().is_some_and(|tools| !tools.is_empty()));
+    if !has_tools {
+        if let Some(object) = result.as_object_mut() {
+            object.remove("tool_choice");
+            object.remove("parallel_tool_calls");
+        }
     }
 
     Ok(result)
@@ -506,6 +527,17 @@ fn map_tool_choice_to_chat(tool_choice: &Value) -> Value {
         },
         _ => tool_choice.clone(),
     }
+}
+
+/// Anthropic carries its parallel-tool constraint inside `tool_choice`, while
+/// OpenAI Chat and Responses expose it as a top-level boolean.  Keep this
+/// separate from selector mapping so both target protocols preserve the same
+/// caller intent.
+pub(crate) fn anthropic_disables_parallel_tool_use(tool_choice: &Value) -> bool {
+    tool_choice
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 fn normalize_openai_system_messages(messages: &mut Vec<Value>) {
@@ -2299,5 +2331,51 @@ mod tests {
             run_tool_choice(json!({"type": "tool", "name": "search"})),
             json!({"type": "function", "function": {"name": "search"}}),
         );
+    }
+
+    #[test]
+    fn tool_choice_disabling_parallel_use_maps_to_chat_top_level_flag() {
+        let input = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": "search", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["tool_choice"], "auto");
+        assert_eq!(result["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn tool_controls_are_dropped_when_batch_tools_are_all_filtered() {
+        let input = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"type": "BatchTool", "name": "batch"}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn tool_controls_are_dropped_when_tool_names_are_empty() {
+        let input = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": [{"name": " ", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
     }
 }

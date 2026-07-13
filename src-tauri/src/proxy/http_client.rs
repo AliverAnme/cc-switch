@@ -13,6 +13,10 @@ use std::time::Duration;
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
 
+/// 专供本地 API 代理转发的客户端。它与业务查询客户端共享代理设置，但绝不
+/// 自动跟随重定向：上游 3xx 不能把 API 凭证或请求体带到另一个 origin。
+static FORWARD_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
+
 /// 当前代理 URL（用于日志和状态查询）
 static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
 
@@ -53,6 +57,7 @@ fn get_proxy_port() -> u16 {
 pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
     let client = build_client(effective_url)?;
+    let forward_client = build_forward_client(effective_url)?;
 
     // 尝试初始化全局客户端，如果已存在则记录警告并使用 apply_proxy 更新
     if GLOBAL_CLIENT.set(RwLock::new(client.clone())).is_err() {
@@ -65,6 +70,7 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
         // 已初始化，改用 apply_proxy 更新
         return apply_proxy(proxy_url);
     }
+    let _ = FORWARD_CLIENT.set(RwLock::new(forward_client));
 
     // 初始化代理 URL 记录
     let _ = CURRENT_PROXY_URL.set(RwLock::new(effective_url.map(|s| s.to_string())));
@@ -106,6 +112,7 @@ pub fn validate_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
     let new_client = build_client(effective_url)?;
+    let new_forward_client = build_forward_client(effective_url)?;
 
     // 更新客户端
     if let Some(lock) = GLOBAL_CLIENT.get() {
@@ -117,6 +124,16 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     } else {
         // 如果还没初始化，则初始化
         return init(proxy_url);
+    }
+
+    if let Some(lock) = FORWARD_CLIENT.get() {
+        let mut client = lock.write().map_err(|e| {
+            log::error!("[GlobalProxy] [GP-005] Failed to acquire forward-client write lock: {e}");
+            "Failed to update forward HTTP client: lock poisoned".to_string()
+        })?;
+        *client = new_forward_client;
+    } else {
+        let _ = FORWARD_CLIENT.set(RwLock::new(new_forward_client));
     }
 
     // 更新代理 URL 记录
@@ -150,6 +167,7 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     let effective_url = proxy_url.filter(|s| !s.trim().is_empty());
     let new_client = build_client(effective_url)?;
+    let new_forward_client = build_forward_client(effective_url)?;
 
     // 更新客户端
     if let Some(lock) = GLOBAL_CLIENT.get() {
@@ -161,6 +179,16 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
     } else {
         // 如果还没初始化，则初始化
         return init(proxy_url);
+    }
+
+    if let Some(lock) = FORWARD_CLIENT.get() {
+        let mut client = lock.write().map_err(|e| {
+            log::error!("[GlobalProxy] [GP-005] Failed to acquire forward-client write lock: {e}");
+            "Failed to update forward HTTP client: lock poisoned".to_string()
+        })?;
+        *client = new_forward_client;
+    } else {
+        let _ = FORWARD_CLIENT.set(RwLock::new(new_forward_client));
     }
 
     // 更新代理 URL 记录
@@ -196,6 +224,18 @@ pub fn get() -> Client {
         })
 }
 
+/// 获取用于 API 请求转发的客户端。它保留当前全局代理配置，但明确禁止自动重定向。
+pub fn get_forward() -> Client {
+    FORWARD_CLIENT
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|client| client.clone())
+        .unwrap_or_else(|| {
+            log::warn!("[GlobalProxy] [GP-006] Forward client not initialized, using fallback");
+            build_forward_client(None).unwrap_or_default()
+        })
+}
+
 /// 获取当前代理 URL
 ///
 /// 返回当前配置的代理 URL，None 表示直连。
@@ -214,6 +254,17 @@ pub fn is_proxy_enabled() -> bool {
 
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_with_redirects(proxy_url, true)
+}
+
+fn build_forward_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_with_redirects(proxy_url, false)
+}
+
+fn build_client_with_redirects(
+    proxy_url: Option<&str>,
+    follow_redirects: bool,
+) -> Result<Client, String> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -225,6 +276,10 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_brotli()
         .no_deflate()
         .no_zstd();
+
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     // 有代理地址则使用代理，否则跟随系统代理
     if let Some(url) = proxy_url {
@@ -369,6 +424,12 @@ mod tests {
     #[test]
     fn test_build_client_direct() {
         let result = build_client(None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_forward_client_direct() {
+        let result = build_forward_client(None);
         assert!(result.is_ok());
     }
 

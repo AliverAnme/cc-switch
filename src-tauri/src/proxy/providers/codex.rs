@@ -142,12 +142,35 @@ pub fn resolve_codex_catalog_tool_profile(
     provider: &Provider,
 ) -> crate::codex_config::CodexCatalogToolProfile {
     use crate::codex_config::CodexCatalogToolProfile;
+    // TOML-only `wire_api = "anthropic"` remains a supported persisted shape.
+    // Check it first because the normalized settings/meta fields may be absent.
     if codex_provider_uses_anthropic(provider) {
         return CodexCatalogToolProfile::Anthropic;
     }
-    CodexCatalogToolProfile::from_api_format(
-        provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
-    )
+
+    // Keep catalog generation aligned with the router for every supported
+    // protocol source.  Custom providers commonly persist `apiFormat` in
+    // settings_config without duplicating it into meta; treating such a native
+    // Responses provider as ProxyChat makes Codex emit the freeform apply_patch
+    // tool, which strict native gateways reject.
+    let api_format = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("api_format")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("apiFormat")
+                .and_then(|value| value.as_str())
+        });
+
+    CodexCatalogToolProfile::from_api_format(api_format)
 }
 
 /// Extract the real upstream model configured for a Codex provider.
@@ -869,7 +892,7 @@ wire_api = "anthropic"
             CodexCatalogToolProfile::Anthropic
         );
 
-        // Native openai_responses (meta) → NativeResponses; chat → ProxyChat.
+        // Native openai_responses (meta or settings) → NativeResponses; chat → ProxyChat.
         let mut native = create_provider(json!({}));
         native.meta = Some(crate::provider::ProviderMeta {
             api_format: Some("openai_responses".to_string()),
@@ -878,6 +901,13 @@ wire_api = "anthropic"
         assert_eq!(
             resolve_codex_catalog_tool_profile(&native),
             CodexCatalogToolProfile::NativeResponses
+        );
+
+        let settings_native = create_provider(json!({ "apiFormat": "openai_responses" }));
+        assert_eq!(
+            resolve_codex_catalog_tool_profile(&settings_native),
+            CodexCatalogToolProfile::NativeResponses,
+            "settings-only native Responses providers must not receive the ProxyChat tool profile"
         );
 
         let chat = create_provider(json!({ "apiFormat": "openai_chat" }));

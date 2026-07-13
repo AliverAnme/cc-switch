@@ -164,18 +164,29 @@ async fn handle_messages_for_app(
     let (parts, body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    let body_bytes = match decode_json_request_body(&mut headers, body_bytes, tag) {
+        Ok(body_bytes) => body_bytes,
+        Err(error) => return Ok(build_anthropic_request_error_response(&error)),
+    };
+    let body = match parse_json_request_body(&body_bytes) {
+        Ok(body) => body,
+        Err(error) => return Ok(build_anthropic_request_error_response(&error)),
+    };
 
     let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+        match RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str)
+            .await
+        {
+            Ok(ctx) => ctx,
+            Err(error) => return Ok(build_anthropic_request_error_response(&error)),
+        };
 
     // 安全分类器请求：协议转换后转发到上游，再转回分类器格式
     // 不再用 mock 短路——让上游模型做真实分类，cc-switch 承担格式转换
@@ -571,12 +582,18 @@ async fn handle_claude_transform(
                 // 现场诊断（content-type/body 摘要），否则命中嗅探臂的用户只拿到
                 // 裸聚合错误、丢失非嗅探臂已有的诊断增强（C7）
                 aggregated.map_err(|e| {
-                    log::error!("[Claude] SSE 聚合兜底失败: {e}, body: {body_str}");
+                    log::error!(
+                        "[Claude] SSE 聚合兜底失败: {e}, body[..120]: {}",
+                        body_snippet(&body_str, 120)
+                    );
                     aggregate_fallback_error(e, &response_headers, &body_str)
                 })?
             }
             Err(e) => {
-                log::error!("[Claude] 解析上游响应失败: {e}, body: {body_str}");
+                log::error!(
+                    "[Claude] 解析上游响应失败: {e}, body[..120]: {}",
+                    body_snippet(&body_str, 120)
+                );
                 return Err(upstream_body_parse_error(
                     "Failed to parse upstream response",
                     &e,
@@ -688,13 +705,14 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
     }
 }
 
-/// Codex 客户端（尤其 Desktop 登录态）可能对请求体启用 zstd 压缩，使得后续
+/// JSON API 客户端可能对请求体启用 zstd/gzip 等压缩，使得后续
 /// `serde_json::from_slice` 直接解析失败。这里在解析前解压，并剥掉已失真的实体头
 /// （content-encoding / content-length / transfer-encoding）——转发层会基于解压后的
 /// 明文 JSON 重新生成正确的头。
-fn decode_codex_request_body(
+fn decode_json_request_body(
     headers: &mut axum::http::HeaderMap,
     body_bytes: Bytes,
+    tag: &str,
 ) -> Result<Bytes, ProxyError> {
     let Some(encoding) = get_content_encoding(headers) else {
         return Ok(body_bytes);
@@ -706,7 +724,7 @@ fn decode_codex_request_body(
         )));
     }
 
-    log::debug!("[Codex] 解压请求体: content-encoding={encoding}");
+    log::debug!("[{tag}] 解压请求体: content-encoding={encoding}");
     let decompressed = match decompress_body(&encoding, &body_bytes) {
         Ok(Some(decompressed)) => decompressed,
         // is_supported_content_encoding 已确保编码受支持，正常不会返回 None；
@@ -717,7 +735,7 @@ fn decode_codex_request_body(
             )));
         }
         Err(e) => {
-            log::warn!("[Codex] 请求体解压失败 ({encoding}): {e}");
+            log::warn!("[{tag}] 请求体解压失败 ({encoding}): {e}");
             return Err(ProxyError::InvalidRequest(format!(
                 "Failed to decompress request body ({encoding}): {e}"
             )));
@@ -729,6 +747,71 @@ fn decode_codex_request_body(
     headers.remove(axum::http::header::TRANSFER_ENCODING);
 
     Ok(Bytes::from(decompressed))
+}
+
+/// Parse a JSON request body at the local protocol boundary.
+///
+/// Malformed JSON is a client-side contract error, not a proxy failure. Keeping
+/// this mapping shared across Claude, Codex, and Gemini entrypoints ensures the
+/// caller receives HTTP 400 and prevents failover from treating it as a local
+/// 500-condition.
+fn parse_json_request_body(body_bytes: &[u8]) -> Result<Value, ProxyError> {
+    serde_json::from_slice(body_bytes)
+        .map_err(|e| ProxyError::InvalidRequest(format!("Failed to parse request body: {e}")))
+}
+
+/// Return an Anthropic-compatible error before a request context exists.
+///
+/// This is intentionally separate from the generic Axum `ProxyError` response:
+/// Claude SDKs expect the top-level `type: error` envelope even when malformed
+/// JSON prevents provider selection.
+fn build_anthropic_request_error_response(error: &ProxyError) -> axum::response::Response {
+    let status = StatusCode::from_u16(map_proxy_error_to_status(error))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let error_type = if matches!(error, ProxyError::InvalidRequest(_)) {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    };
+    (
+        status,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": get_error_message(error),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Return a Google API-compatible error before a Gemini request context exists.
+fn build_gemini_request_error_response(error: &ProxyError) -> axum::response::Response {
+    let status = StatusCode::from_u16(map_proxy_error_to_status(error))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let reason = match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "INVALID_ARGUMENT",
+        StatusCode::UNAUTHORIZED => "UNAUTHENTICATED",
+        StatusCode::FORBIDDEN => "PERMISSION_DENIED",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "ABORTED",
+        StatusCode::TOO_MANY_REQUESTS => "RESOURCE_EXHAUSTED",
+        StatusCode::SERVICE_UNAVAILABLE => "UNAVAILABLE",
+        StatusCode::GATEWAY_TIMEOUT => "DEADLINE_EXCEEDED",
+        _ => "INTERNAL",
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "code": status.as_u16(),
+                "message": get_error_message(error),
+                "status": reason,
+            }
+        })),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -745,18 +828,34 @@ pub async fn handle_chat_completions(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let endpoint = endpoint_with_query(&uri, "/chat/completions");
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    let body_bytes = match decode_json_request_body(&mut headers, body_bytes, "Codex") {
+        Ok(body_bytes) => body_bytes,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
+    let body = match parse_json_request_body(&body_bytes) {
+        Ok(body) => body,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/chat/completions");
+    let mut ctx = match RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
     let is_stream = body
         .get("stream")
@@ -811,18 +910,34 @@ pub async fn handle_responses(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let endpoint = endpoint_with_query(&uri, "/responses");
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    let body_bytes = match decode_json_request_body(&mut headers, body_bytes, "Codex") {
+        Ok(body_bytes) => body_bytes,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
+    let body = match parse_json_request_body(&body_bytes) {
+        Ok(body) => body,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/responses");
+    let mut ctx = match RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
     let is_stream = body
         .get("stream")
@@ -902,18 +1017,34 @@ pub async fn handle_responses_compact(
     let uri = parts.uri;
     let mut headers = parts.headers;
     let extensions = parts.extensions;
+    let endpoint = endpoint_with_query(&uri, "/responses/compact");
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    let body_bytes = match decode_json_request_body(&mut headers, body_bytes, "Codex") {
+        Ok(body_bytes) => body_bytes,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
+    let body = match parse_json_request_body(&body_bytes) {
+        Ok(body) => body,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/responses/compact");
+    let mut ctx = match RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(error) => return build_codex_request_error_response(&endpoint, &error),
+    };
 
     let is_stream = body
         .get("stream")
@@ -1109,12 +1240,18 @@ async fn handle_codex_chat_to_responses_transform(
             log::warn!("[Codex] 上游对非流请求返回未标记的 SSE 体，按 Chat SSE 聚合兜底");
             // 聚合也失败时：保留全量 body 服务端日志，并给客户端错误附带现场诊断（C7）
             chat_sse_to_response_value(&body_str).map_err(|e| {
-                log::error!("[Codex] SSE 聚合兜底失败: {e}, body: {body_str}");
+                log::error!(
+                    "[Codex] SSE 聚合兜底失败: {e}, body[..120]: {}",
+                    body_snippet(&body_str, 120)
+                );
                 aggregate_fallback_error(e, &response_headers, &body_str)
             })?
         }
         Err(e) => {
-            log::error!("[Codex] 解析 Chat 上游响应失败: {e}, body: {body_str}");
+            log::error!(
+                "[Codex] 解析 Chat 上游响应失败: {e}, body[..120]: {}",
+                body_snippet(&body_str, 120)
+            );
             return Err(upstream_body_parse_error(
                 "Failed to parse upstream chat response",
                 &e,
@@ -1263,13 +1400,17 @@ async fn handle_codex_anthropic_to_responses_transform(
         Err(_) if body_looks_like_sse(&body_str) => {
             log::warn!("[Codex] Upstream returned an unmarked Anthropic SSE body, falling back to aggregation");
             transform_codex_anthropic::anthropic_sse_to_message_value(&body_str).map_err(|e| {
-                log::error!("[Codex] Failed to aggregate Anthropic SSE body: {e}");
-                e
+                log::error!(
+                    "[Codex] Failed to aggregate Anthropic SSE body: {e}, body[..120]: {}",
+                    body_snippet(&body_str, 120)
+                );
+                aggregate_fallback_error(e, &response_headers, &body_str)
             })?
         }
         Err(e) => {
             log::error!(
-                "[Codex] Failed to parse Anthropic upstream response: {e}, body: {body_str}"
+                "[Codex] Failed to parse Anthropic upstream response: {e}, body[..120]: {}",
+                body_snippet(&body_str, 120)
             );
             return Err(upstream_body_parse_error(
                 "Failed to parse upstream anthropic response",
@@ -1534,6 +1675,35 @@ async fn handle_codex_chat_error_response(
 /// 注意：`endpoint` 经 `endpoint_with_query` 可能携带 query（如 `?beta=true`）并被
 /// 原样写入错误体。当前 Codex 端点不在 query 里放凭证，故安全；若将来复用到
 /// query 携带密钥的端点（如 Gemini 的 `?key=`），需先脱敏再回显。
+///
+/// The local JSON/decompression boundary runs before provider selection, so this
+/// companion keeps Codex's three endpoints protocol-compatible even when no
+/// `RequestContext` exists yet.
+fn build_codex_request_error_response(
+    endpoint: &str,
+    error: &ProxyError,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = axum::http::StatusCode::from_u16(map_proxy_error_to_status(error))
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = codex_proxy_error_json("CC Switch", "<unresolved>", endpoint, error);
+    let body = serde_json::to_vec(&body).map_err(|e| {
+        log::error!("[Codex] 序列化请求错误体失败: {e}");
+        ProxyError::Internal(format!("Failed to serialize request error: {e}"))
+    })?;
+
+    axum::response::Response::builder()
+        .status(status)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .body(axum::body::Body::from(body))
+        .map_err(|e| {
+            log::error!("[Codex] 构建请求错误响应失败: {e}");
+            ProxyError::Internal(format!("Failed to build request error response: {e}"))
+        })
+}
+
 fn build_codex_proxy_error_response(
     ctx: &RequestContext,
     endpoint: &str,
@@ -1726,26 +1896,36 @@ pub async fn handle_gemini(
 ) -> Result<axum::response::Response, ProxyError> {
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = match decode_json_request_body(&mut headers, body_bytes, "Gemini") {
+        Ok(body_bytes) => body_bytes,
+        Err(error) => return Ok(build_gemini_request_error_response(&error)),
+    };
     // GET 类只读端点（/v1beta/models、/v1beta/models/<model> 等）没有请求体，
     // 不能强制 parse 为 JSON —— 否则空 body 会被拒绝。
     let body: Value = if body_bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&body_bytes)
-            .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?
+        match parse_json_request_body(&body_bytes) {
+            Ok(body) => body,
+            Err(error) => return Ok(build_gemini_request_error_response(&error)),
+        }
     };
 
     // Gemini 的模型名称在 URI 中
-    let mut ctx = RequestContext::new(&state, &body, &headers, AppType::Gemini, "Gemini", "gemini")
-        .await?
-        .with_model_from_uri(&uri);
+    let mut ctx =
+        match RequestContext::new(&state, &body, &headers, AppType::Gemini, "Gemini", "gemini")
+            .await
+        {
+            Ok(ctx) => ctx.with_model_from_uri(&uri),
+            Err(error) => return Ok(build_gemini_request_error_response(&error)),
+        };
 
     // 提取完整的路径和查询参数
     let endpoint = uri
@@ -2436,11 +2616,87 @@ async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, body_snippet, chat_sse_to_response_value, codex_proxy_error_json,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        aggregate_fallback_error, body_looks_like_sse, body_snippet,
+        build_anthropic_request_error_response, build_codex_request_error_response,
+        build_gemini_request_error_response, chat_sse_to_response_value, codex_proxy_error_json,
+        parse_json_request_body, responses_sse_to_response_value,
+        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use flate2::{write::GzEncoder, Compression};
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use std::io::Write;
+
+    #[test]
+    fn malformed_request_json_is_an_invalid_request() {
+        let err = parse_json_request_body(br#"{"model": "gpt-5",}"#).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidRequest(_)));
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn compressed_json_request_is_decoded_and_entity_headers_are_cleared() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(br#"{"model":"test"}"#).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("content-length", "999".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let decoded =
+            super::decode_json_request_body(&mut headers, Bytes::from(compressed), "test").unwrap();
+
+        assert_eq!(decoded.as_ref(), br#"{"model":"test"}"#);
+        assert!(headers.get("content-encoding").is_none());
+        assert!(headers.get("content-length").is_none());
+        assert!(headers.get("transfer-encoding").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_request_errors_use_client_protocol_envelopes() {
+        let error = ProxyError::InvalidRequest("invalid JSON".to_string());
+        let anthropic = build_anthropic_request_error_response(&error);
+        assert_eq!(anthropic.status(), StatusCode::BAD_REQUEST);
+        let anthropic_body = anthropic.into_body().collect().await.unwrap().to_bytes();
+        let anthropic_json: Value = serde_json::from_slice(&anthropic_body).unwrap();
+        assert_eq!(anthropic_json["type"], "error");
+        assert_eq!(anthropic_json["error"]["type"], "invalid_request_error");
+
+        let gemini = build_gemini_request_error_response(&error);
+        assert_eq!(gemini.status(), StatusCode::BAD_REQUEST);
+        let gemini_body = gemini.into_body().collect().await.unwrap().to_bytes();
+        let gemini_json: Value = serde_json::from_slice(&gemini_body).unwrap();
+        assert_eq!(gemini_json["error"]["code"], 400);
+        assert_eq!(gemini_json["error"]["status"], "INVALID_ARGUMENT");
+
+        let codex = build_codex_request_error_response("/responses?beta=true", &error).unwrap();
+        assert_eq!(codex.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            codex.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let codex_body = codex.into_body().collect().await.unwrap().to_bytes();
+        let codex_json: Value = serde_json::from_slice(&codex_body).unwrap();
+        assert!(codex_json["error"].is_object());
+        assert_eq!(codex_json["error"]["code"], "cc_switch_invalid_request");
+        assert!(codex_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("/responses?beta=true"));
+
+        let unavailable = build_gemini_request_error_response(&ProxyError::NoAvailableProvider);
+        let unavailable_body = unavailable.into_body().collect().await.unwrap().to_bytes();
+        let unavailable_json: Value = serde_json::from_slice(&unavailable_body).unwrap();
+        assert_eq!(unavailable_json["error"]["code"], 503);
+        assert_eq!(unavailable_json["error"]["status"], "UNAVAILABLE");
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
@@ -2496,6 +2752,27 @@ mod tests {
             ProxyError::TransformError(msg) => {
                 assert!(msg.contains("content-type: <none>"), "{msg}");
                 assert!(msg.contains("content-encoding: <none>"), "{msg}");
+            }
+            other => panic!("expected TransformError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_fallback_error_carries_field_diagnostics() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let err = aggregate_fallback_error(
+            ProxyError::TransformError("invalid Anthropic SSE".to_string()),
+            &headers,
+            "data: malformed",
+        );
+
+        match err {
+            ProxyError::TransformError(msg) => {
+                assert!(msg.contains("invalid Anthropic SSE"), "{msg}");
+                assert!(msg.contains("content-type: application/json"), "{msg}");
+                assert!(msg.contains("data: malformed"), "{msg}");
             }
             other => panic!("expected TransformError, got {other:?}"),
         }
