@@ -451,11 +451,38 @@ fn codex_catalog_model_entry(
     entry_obj.insert("availability_nux".to_string(), Value::Null);
     entry_obj.insert("upgrade".to_string(), Value::Null);
 
-    if profile != CodexCatalogToolProfile::ProxyChat {
-        // Native `/responses` and Anthropic gateways don't support speed/service tiers
-        entry_obj.insert("additional_speed_tiers".to_string(), json!([]));
-        entry_obj.insert("service_tiers".to_string(), json!([]));
+    // The reasoning slider in Codex is driven by these catalog fields. Keep the
+    // official GPT-5.6 range on every third-party model so its picker is not
+    // hidden merely because the model is supplied by another provider.
+    entry_obj.insert("default_reasoning_level".to_string(), json!("low"));
+    entry_obj.insert(
+        "supported_reasoning_levels".to_string(),
+        json!([
+            { "effort": "low", "description": "Fast responses with lighter reasoning" },
+            { "effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+            { "effort": "high", "description": "Greater reasoning depth for complex problems" },
+            { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+            { "effort": "max", "description": "Maximum reasoning depth for the hardest problems" },
+            { "effort": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+        ]),
+    );
 
+    // Keep Codex's Fast picker available for every cc-switch generated model
+    // catalog. This is client-side catalog capability metadata, not an
+    // instruction to enable Fast for every request. The actual request-time
+    // `service_tier` remains controlled by the Codex client (or the explicit
+    // Codex OAuth `codexFastMode` setting).
+    entry_obj.insert("additional_speed_tiers".to_string(), json!(["fast"]));
+    entry_obj.insert(
+        "service_tiers".to_string(),
+        json!([{
+            "id": "priority",
+            "name": "Fast",
+            "description": "1.5x speed, increased usage"
+        }]),
+    );
+
+    if profile != CodexCatalogToolProfile::ProxyChat {
         // Native `/responses` and Anthropic gateways reject / drop Codex's freeform
         // `apply_patch` (type=="custom") tool. Strip any key that would make Codex
         // emit a custom/freeform tool, and rely on shell_type="shell_command" for
@@ -904,6 +931,37 @@ fn codex_model_catalog_from_settings(
     )))
 }
 
+/// Add a one-row catalog for a third-party Codex config that only declares a
+/// top-level `model`. Older custom providers commonly have this shape; without
+/// a catalog Codex has no metadata from which to render the reasoning slider.
+fn settings_with_codex_model_catalog_fallback(settings: &Value, config_text: &str) -> Value {
+    if settings.get("modelCatalog").is_some() {
+        return settings.clone();
+    }
+
+    let Some(model) = config_text.parse::<toml::Value>().ok().and_then(|doc| {
+        doc.get("model")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+    }) else {
+        return settings.clone();
+    };
+
+    let mut settings = settings.clone();
+    let Some(obj) = settings.as_object_mut() else {
+        return settings;
+    };
+    obj.insert(
+        "modelCatalog".to_string(),
+        json!({
+            "models": [{ "model": model }]
+        }),
+    );
+    settings
+}
+
 fn set_codex_model_catalog_json_field(
     config_text: &str,
     catalog_path: Option<&Path>,
@@ -1189,8 +1247,21 @@ pub fn write_codex_provider_live_with_catalog(
     config_text: Option<&str>,
     profile: CodexCatalogToolProfile,
 ) -> Result<(), AppError> {
+    // Never synthesize a custom catalog for OpenAI's official config. For every
+    // third-party config, however, provide a one-model fallback when the form
+    // did not persist an explicit modelCatalog, so Codex can render its slider.
+    let catalog_settings = config_text.map(|text| {
+        if category.is_some_and(|value| value.eq_ignore_ascii_case("official")) {
+            settings.clone()
+        } else {
+            settings_with_codex_model_catalog_fallback(settings, text)
+        }
+    });
     let prepared_config = config_text
-        .map(|text| prepare_codex_config_text_with_model_catalog(settings, text, profile))
+        .zip(catalog_settings.as_ref())
+        .map(|(text, catalog_settings)| {
+            prepare_codex_config_text_with_model_catalog(catalog_settings, text, profile)
+        })
         .transpose()?;
 
     write_codex_live_for_provider(category, auth, prepared_config.as_deref())
@@ -2607,6 +2678,23 @@ base_url = "https://production.api/v1"
             entry.get("context_window").and_then(|v| v.as_u64()),
             Some(1_000_000)
         );
+        assert_eq!(entry.get("additional_speed_tiers"), Some(&json!(["fast"])));
+        assert_eq!(entry.get("default_reasoning_level"), Some(&json!("low")));
+        assert_eq!(
+            entry
+                .get("supported_reasoning_levels")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(6),
+            "every third-party entry should expose Codex's reasoning slider"
+        );
+        assert_eq!(
+            entry
+                .pointer("/service_tiers/0/id")
+                .and_then(|v| v.as_str()),
+            Some("priority"),
+            "native entries should expose Codex's optional Fast picker"
+        );
     }
 
     #[test]
@@ -2666,6 +2754,67 @@ base_url = "https://production.api/v1"
                 .and_then(|v| v.as_str()),
             Some("freeform"),
             "ProxyChat must preserve apply_patch_tool_type (no native stripping)"
+        );
+    }
+
+    #[test]
+    fn every_catalog_profile_exposes_the_optional_fast_picker() {
+        let specs = vec![CodexCatalogModelSpec {
+            model: "x".to_string(),
+            display_name: "x".to_string(),
+            context_window: 128_000,
+            supports_parallel_tool_calls: None,
+            input_modalities: None,
+            base_instructions: None,
+        }];
+
+        for profile in [
+            CodexCatalogToolProfile::ProxyChat,
+            CodexCatalogToolProfile::NativeResponses,
+            CodexCatalogToolProfile::Anthropic,
+        ] {
+            let entry = &codex_model_catalog_from_specs(
+                &specs,
+                &load_codex_native_responses_template(),
+                profile,
+            )["models"][0];
+            assert_eq!(entry.get("additional_speed_tiers"), Some(&json!(["fast"])));
+            assert_eq!(entry.get("default_reasoning_level"), Some(&json!("low")));
+            assert_eq!(
+                entry
+                    .pointer("/service_tiers/0/id")
+                    .and_then(|v| v.as_str()),
+                Some("priority")
+            );
+            assert_eq!(
+                entry
+                    .get("supported_reasoning_levels")
+                    .and_then(|value| value.as_array())
+                    .map(Vec::len),
+                Some(6)
+            );
+        }
+    }
+
+    #[test]
+    fn third_party_model_catalog_fallback_uses_top_level_model() {
+        let settings = json!({ "auth": {} });
+        let fallback = settings_with_codex_model_catalog_fallback(
+            &settings,
+            "model = \"third-party-coder\"\nmodel_provider = \"custom\"\n",
+        );
+        assert_eq!(
+            fallback.pointer("/modelCatalog/models/0/model"),
+            Some(&json!("third-party-coder"))
+        );
+
+        let explicit = json!({
+            "modelCatalog": { "models": [{ "model": "explicit-model" }] }
+        });
+        assert_eq!(
+            settings_with_codex_model_catalog_fallback(&explicit, "model = \"ignored\""),
+            explicit,
+            "an explicit catalog remains the DB source of truth"
         );
     }
 
