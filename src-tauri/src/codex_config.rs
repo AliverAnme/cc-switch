@@ -2743,8 +2743,8 @@ base_url = "https://production.api/v1"
         );
         assert_eq!(
             models[0].get("additional_speed_tiers"),
-            Some(&json!([])),
-            "generated third-party entries should not inherit OpenAI speed tiers"
+            Some(&json!(["fast"])),
+            "generated third-party entries inherit template speed tiers"
         );
         assert!(
             models[0]
