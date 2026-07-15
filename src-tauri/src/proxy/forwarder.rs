@@ -3707,8 +3707,9 @@ mod tests {
             ),
         };
 
+        let provider = test_provider_with_type(None);
         assert_eq!(
-            forwarder.categorize_proxy_error(&error),
+            forwarder.categorize_proxy_error(&error, &provider),
             ErrorCategory::Retryable
         );
     }
