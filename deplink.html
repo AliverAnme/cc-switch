@@ -2015,9 +2015,12 @@ requires_openai_auth = true`;
 
             // 显示结果
             document.getElementById('providerUrl').textContent = url;
-            if (url.startsWith('ccswitch://')) {
-                document.getElementById('providerImportBtn').href = url;
-            }
+            try {
+                const parsed = new URL(url);
+                if (parsed.protocol === 'ccswitch:') {
+                    document.getElementById('providerImportBtn').href = url;
+                }
+            } catch {}
             document.getElementById('providerResult').style.display = 'block';
 
             // 滚动到结果
@@ -2110,9 +2113,12 @@ requires_openai_auth = true`;
 
             // 显示结果
             document.getElementById('promptUrl').textContent = url;
-            if (url.startsWith('ccswitch://')) {
-                document.getElementById('promptImportBtn').href = url;
-            }
+            try {
+                const parsed = new URL(url);
+                if (parsed.protocol === 'ccswitch:') {
+                    document.getElementById('promptImportBtn').href = url;
+                }
+            } catch {}
             document.getElementById('promptResult').style.display = 'block';
 
             // 滚动到结果
