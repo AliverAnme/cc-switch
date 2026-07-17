@@ -94,7 +94,7 @@ winreg = "0.55"
 windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_UI_Shell"] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
-rquickjs = { version = "0.8", features = ["bindgen"] }
+rquickjs = { version = "0.12", features = ["bindgen"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
