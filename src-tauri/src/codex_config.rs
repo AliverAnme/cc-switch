@@ -465,7 +465,7 @@ fn codex_catalog_model_entry(
     entry_obj.insert("description".to_string(), json!(spec.display_name));
     entry_obj.insert("context_window".to_string(), json!(spec.context_window));
     entry_obj.insert("max_context_window".to_string(), json!(spec.context_window));
-    entry_obj.insert("priority".to_string(), json!(1000 + priority));
+    entry_obj.insert("priority".to_string(), json!((1000 + priority).to_string()));
     entry_obj.insert("additional_speed_tiers".to_string(), json!([]));
     entry_obj.insert("service_tiers".to_string(), json!([]));
     entry_obj.insert("availability_nux".to_string(), Value::Null);

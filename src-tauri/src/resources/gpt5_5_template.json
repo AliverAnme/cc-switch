@@ -32,7 +32,7 @@
   "shell_type": "shell_command",
   "visibility": "list",
   "supported_in_api": true,
-  "priority": 0,
+  "priority": "0",
   "additional_speed_tiers": ["fast"],
   "service_tiers": [
     {
