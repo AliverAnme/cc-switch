@@ -73,7 +73,7 @@
     "mode": "tokens",
     "limit": 10000
   },
-  "comp_hash": 3000,
+  "comp_hash": "3000",
   "support_verbosity": true,
   "default_verbosity": "low",
   "include_skills_usage_instructions": true,
