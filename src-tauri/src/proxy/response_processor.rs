@@ -852,6 +852,9 @@ fn format_headers(headers: &HeaderMap) -> String {
         .keys()
         .map(|key| {
             let name = key.as_str();
+            if is_sensitive_header_for_log(name) {
+                return format!("{name}=<redacted>");
+            }
             if !is_safe_diagnostic_header(name) {
                 return name.to_string();
             }
@@ -870,6 +873,19 @@ fn format_headers(headers: &HeaderMap) -> String {
         .collect::<Vec<_>>();
     entries.sort();
     format!("[{}]", entries.join(", "))
+}
+
+fn is_sensitive_header_for_log(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "x-anthropic-api-key"
+    )
 }
 
 #[cfg(test)]

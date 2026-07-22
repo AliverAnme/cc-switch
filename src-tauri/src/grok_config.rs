@@ -68,8 +68,7 @@ pub fn validate_config_toml_syntax(config_toml: &str) -> Result<(), AppError> {
     if config_toml.trim().is_empty() {
         return Ok(());
     }
-    config_toml
-        .parse::<toml::Value>()
+    toml::from_str::<toml::Value>(config_toml)
         .map(|_| ())
         .map_err(|error| {
             AppError::localized(
@@ -87,7 +86,7 @@ pub fn validate_config_toml_syntax(config_toml: &str) -> Result<(), AppError> {
 /// 让残缺的自定义配置继续走 `validate_config_toml` 报出真实错误，
 /// 而不是被误判成官方态静默吞掉。语法不合法同样返回 false。
 pub fn is_official_live_config(config_toml: &str) -> bool {
-    let Ok(document) = config_toml.parse::<toml::Value>() else {
+    let Ok(document) = toml::from_str::<toml::Value>(config_toml) else {
         return false;
     };
     document

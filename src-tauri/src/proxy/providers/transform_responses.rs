@@ -15,6 +15,20 @@ use super::reasoning_bridge::{
     anthropic_block_from_openai_reasoning_item, openai_reasoning_item_from_anthropic_block,
 };
 
+/// Applies an explicitly selected OpenAI Responses cache-retention policy.
+pub(crate) fn apply_prompt_cache_retention(result: &mut Value, retention: Option<&str>) {
+    let Some(retention) = retention.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if matches!(retention, "in_memory" | "24h") {
+        result["prompt_cache_retention"] = json!(retention);
+    } else {
+        log::warn!(
+            "[Transform] ignoring unsupported OpenAI prompt_cache_retention `{retention}`; expected `in_memory` or `24h`"
+        );
+    }
+}
+
 pub(crate) const TOOL_RESULT_ERROR_MARKER: &str = "[cc-switch:tool-result-error]";
 
 fn anthropic_image_to_responses_part(block: &Value) -> Option<Value> {

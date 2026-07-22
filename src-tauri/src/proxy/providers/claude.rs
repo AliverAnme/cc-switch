@@ -426,6 +426,18 @@ pub fn transform_claude_request_for_api_format(
                 }
                 result["include"] = json!(include);
             }
+            // `cache_control` cannot be forwarded to Responses. Preserve the
+            // closest *explicitly requested* cache policy instead of silently
+            // turning Anthropic's TTL into a different OpenAI billing policy.
+            if !is_codex_oauth {
+                super::transform_responses::apply_prompt_cache_retention(
+                    &mut result,
+                    provider
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.prompt_cache_retention.as_deref()),
+                );
+            }
             Ok(result)
         }
         "openai_chat" => {

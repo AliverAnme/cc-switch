@@ -2934,8 +2934,10 @@ async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_to_response_value,
+        body_looks_like_sse, build_anthropic_request_error_response,
+        build_codex_request_error_response, build_gemini_request_error_response,
+        chat_sse_to_response_value, classify_body_for_diagnostics, codex_proxy_error_json,
+        parse_json_request_body, responses_sse_to_response_value,
         should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
