@@ -28,7 +28,7 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tauri = { version = "2.11.1", features = ["tray-icon", "protocol-asset", "image-png"] }
-tauri-plugin-log = "~2.8.0"
+tauri-plugin-log = "~2.9.0"
 tauri-plugin-opener = "~2.5.4"
 tauri-plugin-process = "~2.3.1"
 tauri-plugin-updater = "~2.10.1"
@@ -50,7 +50,7 @@ async-stream = "0.3"
 bytes = "1.5"
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "client-legacy"] }
 hyper-rustls = { version = "0.27", features = ["http1", "tls12", "ring", "webpki-tokio"] }
@@ -66,7 +66,7 @@ regex = "1.10"
 rquickjs = { version = "0.12", features = ["array-buffer", "classes"] }
 thiserror = "2.0"
 anyhow = "1.0"
-zip = "4.6"
+zip = "8.6"
 serde_yaml = "0.9"
 tempfile = "3"
 url = "2.5"
@@ -91,7 +91,7 @@ tauri-plugin-single-instance = "2"
 webkit2gtk = { version = "2.0.1", features = ["v2_16"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.55"
+winreg = "0.56"
 windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_UI_Shell"] }
 
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
