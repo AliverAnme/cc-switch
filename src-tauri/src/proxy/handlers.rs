@@ -2469,6 +2469,24 @@ fn error_event_message(error: &Value) -> Option<String> {
     None
 }
 
+/// 取 body 前 `max_chars` 个字符的单行摘要：\r 丢弃、\n 折叠为字面 \n、
+/// 其余控制字符替换为 �，超长加省略号。
+fn body_snippet(body: &str, max_chars: usize) -> String {
+    let mut snippet = String::new();
+    for c in body.chars().take(max_chars) {
+        match c {
+            '\n' => snippet.push_str("\\n"),
+            '\r' => {}
+            c if c.is_control() => snippet.push('\u{FFFD}'),
+            c => snippet.push(c),
+        }
+    }
+    if body.chars().nth(max_chars).is_some() {
+        snippet.push('…');
+    }
+    snippet
+}
+
 /// 解析单个 SSE 块的 event 名与 data 负载（多行 data 按规范以 \n 连接）。
 /// 行首允许前导空白后再匹配字段名——与 body_looks_like_sse 的 trim 宽容度对齐，
 /// 否则缩进的 `  data:` 行被嗅探接受却在此静默丢失（C4）。返回 None 表示无 data 行。
