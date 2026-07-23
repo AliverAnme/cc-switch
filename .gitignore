@@ -58,3 +58,13 @@ chatgpt-desktop-analysis/
 codex/
 scripts/patch-codex-macos.mjs
 src-tauri/codex-windows-fast-patch-skill/
+# Pi subagent runtime artifacts
+.pi-subagents/
+# Impeccable hook cache
+.impeccable/
+# Remember memory logs
+.remember/
+# pnpm content-addressable store
+.pnpm-store/
+# Local deep-link test page (not part of app source)
+deplink.html
